@@ -17,24 +17,24 @@ services:
       - ./config/my.cnf:/etc/mysql/conf.d/my.cnf
     command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
 
-  phpmyadmin:
-    image: phpmyadmin:latest
-    container_name: phpmyadmin
-    restart: always
-    environment:
-      PMA_HOST: mariadb
-      PMA_PORT: 3306
-      MYSQL_ROOT_PASSWORD: rootpassword
-    ports:
-      - "8088:80"
-    depends_on:
-      - mariadb
+  # phpmyadmin:
+  #   image: phpmyadmin:latest
+  #   container_name: phpmyadmin
+  #   restart: always
+  #   environment:
+  #     PMA_HOST: mariadb
+  #     PMA_PORT: 3306
+  #     MYSQL_ROOT_PASSWORD: rootpassword
+  #   ports:
+  #     - "8088:80"
+  #   depends_on:
+  #     - mariadb
 
 volumes:
-  #mariadb_data:
   mariadb_data:
-    driver: local
-    driver_opts:
-      type: none
-      o: bind
-      device: ./data/mysql-104
+  # mariadb_data:
+  #   driver: local
+  #   driver_opts:
+  #     type: none
+  #     o: bind
+  #     device: ./data/mysql-104
