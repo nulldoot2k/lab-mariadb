@@ -1,0 +1,72 @@
+version: "3.9"
+
+services:
+
+  mariadb1:
+    image: mariadb:10.11
+    container_name: mariadb1
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+    volumes:
+      - mariadb1_data:/var/lib/mysql
+      - ./config/database/galera.cnf:/etc/mysql/conf.d/galera.cnf
+    command: >
+      --wsrep-new-cluster
+      --wsrep_node_name=node1
+      --wsrep_node_address=mariadb1
+    networks:
+      - galera-net
+
+  mariadb2:
+    image: mariadb:10.11
+    container_name: mariadb2
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+    volumes:
+      - mariadb2_data:/var/lib/mysql
+      - ./config/database/galera.cnf:/etc/mysql/conf.d/galera.cnf
+    command: >
+      --wsrep_node_name=node2
+      --wsrep_node_address=mariadb2
+    networks:
+      - galera-net
+
+  mariadb3:
+    image: mariadb:10.11
+    container_name: mariadb3
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+    volumes:
+      - mariadb3_data:/var/lib/mysql
+      - ./config/database/galera.cnf:/etc/mysql/conf.d/galera.cnf
+    command: >
+      --wsrep_node_name=node3
+      --wsrep_node_address=mariadb3
+    networks:
+      - galera-net
+
+  haproxy:
+    image: haproxy:2.9
+    container_name: haproxy
+    restart: always
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./config/haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg
+    depends_on:
+      - mariadb1
+      - mariadb2
+      - mariadb3
+    networks:
+      - galera-net
+volumes:
+  mariadb1_data:
+  mariadb2_data:
+  mariadb3_data:
+
+networks:
+  galera-net:
+    driver: bridge
