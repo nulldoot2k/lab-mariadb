@@ -21,6 +21,8 @@ Bài thực hành vận hành MariaDB với Docker — tập trung vào kịch b
 
 ## 1. Tổng quan kiến trúc
 
+### Mariadb StandBy
+
 ```
                     ┌───────────────────────────────────────────┐
                     │              Máy điều khiển               │
@@ -42,24 +44,57 @@ Bài thực hành vận hành MariaDB với Docker — tập trung vào kịch b
 
 **STANDBY** — DB dự phòng, chứa data mới nhất trong lúc PRIMARY ngừng hoạt động. Là nguồn để restore.
 
+
+### Mariadb Cluster
+
+```
+        Client
+           │
+           │
+        HAProxy
+           │
+   ┌───────┼────────┐
+   │       │        │
+MariaDB1 MariaDB2 MariaDB3
+ Galera   Galera   Galera
+```
+
 ---
 
 ## 2. Cấu trúc thư mục
 
 ```
 lab-mariadb/
-├── deploy.sh                    # Deploy / xóa MariaDB lên nhiều server qua SSH
-├── docker-compose.yml           # MariaDB 10.4 + phpMyAdmin
-├── config/
-│   └── my.cnf                   # Cấu hình MariaDB (charset, buffer, v.v.)
-├── data/
-│   └── mysql-104/               # Mount point dữ liệu (tuỳ chọn bind mount)
-└── script/
-    ├── generate_moodle_db.sh    # Tạo dữ liệu giả lập Moodle
-    ├── check_moodle_db.sh       # Kiểm tra / thống kê DB
-    ├── insert_auto.sh           # Giả lập hoạt động liên tục (mỗi 5 giây)
-    ├── main_restore.sh          # 🔴 Restore DB: STANDBY → PRIMARY
-    └── main_rollback.sh         # 🔵 Rollback: hoàn tác restore trên TARGET
+│
+├── compose/                         # Docker stack
+│   ├── docker-compose.yml           # MariaDB single + phpMyAdmin
+│   └── docker-compose-galera.yml    # Galera cluster + HAProxy
+├── configs/                         # Config service
+│   ├── mariadb/
+│   │   ├── my.cnf
+│   │   └── galera.cnf
+│   └── haproxy/
+│       └── haproxy.cfg
+├── data/                            # Volume data (lab only)
+│   ├── galera/
+│   │   ├── node1
+│   │   ├── node2
+│   │   └── node3
+│   └── standalone/
+│       └── mysql-104
+├── scripts/                         # Scripts thao tác DB
+│   ├── generate/
+│   │   ├── generate_moodle_db.sh
+│   │   └── generate_moodle_auto_db.sh
+│   ├── check/
+│   │   ├── check_moodle_db.sh
+│   │   └── check_cron_ba.sh
+│   └── recovery/
+│       ├── main_restore.sh
+│       └── main_rollback.sh
+├── deploy/                          # Script triển khai infra
+│   └── deploy.sh
+└── README.md
 ```
 
 ---

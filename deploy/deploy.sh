@@ -8,10 +8,10 @@ set -euo pipefail
 # =========================================
 # Config
 # =========================================
-LOCAL_DIR="$(cd "$(dirname "$0")" && pwd)"
-SCRIPT_DIR="${LOCAL_DIR}/script"
+BASE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+LOCAL_DIR="${BASE_DIR}"
 REMOTE_DIR="/root/mariadb"
-COPY_ITEMS=("config" "data" "docker-compose.yml" "script")
+COMPOSE_FILE="compose/docker-compose.yml"
 
 # =========================================
 # Colors
@@ -125,13 +125,13 @@ do_deploy() {
     for i in $(seq 0 $((SERVER_COUNT - 1))); do
         echo "    #$((i+1))  ${SSH_USERS[$i]}@${SERVERS[$i]}:${SSH_PORTS[$i]}"
     done
-    echo "  Copy       : ${COPY_ITEMS[*]}"
+    echo "  Copy       : tất cả nội dung → ${REMOTE_DIR}/"
     echo "  ════════════════════════════════════════════════════"
     echo ""
     read -p "  Tiếp tục? (yes/no): " confirm
     [[ "$confirm" == "yes" ]] || { echo "Hủy."; return 0; }
 
-    check_ssh  || return 1
+    check_ssh    || return 1
     check_docker || return 1
 
     step "[3] Copy files & docker-compose up -d..."
@@ -145,16 +145,24 @@ do_deploy() {
             ssh -p "$port" -o StrictHostKeyChecking=no "${user}@${host}" \
                 "mkdir -p ${REMOTE_DIR}" &>/dev/null \
                 || { echo "fail: không tạo được thư mục" > "$rf"; exit 1; }
-            for item in "${COPY_ITEMS[@]}"; do
-                local src="${LOCAL_DIR}/${item}"
-                [ ! -e "$src" ] && continue
-                scp -P "$port" -o StrictHostKeyChecking=no -r \
-                    "$src" "${user}@${host}:${REMOTE_DIR}/" &>/dev/null \
-                    || { echo "fail: copy ${item} thất bại" > "$rf"; exit 1; }
-            done
+            # Copy toàn bộ nội dung LOCAL_DIR lên REMOTE_DIR (y hệt cấu trúc local)
+            if command -v rsync &>/dev/null; then
+                rsync -az -e "ssh -p ${port} -o StrictHostKeyChecking=no" \
+                    --exclude='.git' \
+                    "${LOCAL_DIR}/" "${user}@${host}:${REMOTE_DIR}/" &>/dev/null \
+                    || { echo "fail: copy files thất bại" > "$rf"; exit 1; }
+            else
+                for item in compose configs data scripts deploy; do
+                    local src="${LOCAL_DIR}/${item}"
+                    [ ! -e "$src" ] && continue
+                    scp -P "$port" -o StrictHostKeyChecking=no -r \
+                        "$src" "${user}@${host}:${REMOTE_DIR}/" &>/dev/null \
+                        || { echo "fail: copy ${item} thất bại" > "$rf"; exit 1; }
+                done
+            fi
             ssh -p "$port" -o StrictHostKeyChecking=no "${user}@${host}" "
                 cd ${REMOTE_DIR}
-                docker compose up -d 2>/dev/null || docker-compose up -d
+                docker compose -f ${COMPOSE_FILE} up -d 2>/dev/null || docker-compose -f ${COMPOSE_FILE} up -d
             " &>/dev/null || { echo "fail: docker-compose up -d thất bại" > "$rf"; exit 1; }
             echo "ok" > "$rf"
         ) &
@@ -213,7 +221,7 @@ do_delete() {
                 "[ -d ${REMOTE_DIR} ]" &>/dev/null; then
                 echo "no_dir" > "${tmp_check}/r_${i}"
             elif ssh -p "$port" -o StrictHostKeyChecking=no "${user}@${host}" \
-                "[ -f ${REMOTE_DIR}/docker-compose.yml ]" &>/dev/null; then
+                "[ -f ${REMOTE_DIR}/${COMPOSE_FILE} ]" &>/dev/null; then
                 echo "has_compose" > "${tmp_check}/r_${i}"
             else
                 echo "no_compose" > "${tmp_check}/r_${i}"
@@ -229,8 +237,8 @@ do_delete() {
         local host=${SERVERS[$i]}
         local r=$(cat "${tmp_check}/r_${i}" 2>/dev/null || echo "no_dir")
         case "$r" in
-            has_compose) ok "${host} — có docker-compose.yml → sẽ down -v rồi xóa" ;;
-            no_compose)  warn "${host} — thư mục tồn tại nhưng không có docker-compose.yml → sẽ xóa thư mục" ;;
+            has_compose) ok "${host} — có ${COMPOSE_FILE} → sẽ down -v rồi xóa" ;;
+            no_compose)  warn "${host} — thư mục tồn tại nhưng không có ${COMPOSE_FILE} → sẽ xóa thư mục" ;;
             no_dir)      fail "${host} — thư mục ${REMOTE_DIR} không tồn tại, chưa deploy?"; all_ok=false ;;
         esac
     done
@@ -251,7 +259,7 @@ do_delete() {
             if [ "$cr" = "has_compose" ]; then
                 ssh -p "$port" -o StrictHostKeyChecking=no "${user}@${host}" "
                     cd ${REMOTE_DIR}
-                    docker compose down -v 2>/dev/null || docker-compose down -v
+                    docker compose -f ${COMPOSE_FILE} down -v 2>/dev/null || docker-compose -f ${COMPOSE_FILE} down -v
                 " &>/dev/null || { echo "fail: docker-compose down -v thất bại" > "$rf"; exit 1; }
             fi
             ssh -p "$port" -o StrictHostKeyChecking=no "${user}@${host}" \
@@ -283,7 +291,40 @@ do_delete() {
     echo "  ════════════════════════════════════════════════════"
 }
 
+# =========================================
+# Function: chạy script trên remote
+# =========================================
+run_remote_script() {
+    local script_path="$1"
+    local remote_script="${REMOTE_DIR}/${script_path}"
 
+    step "Chạy $(basename ${script_path}) trên ${SERVER_COUNT} server..."
+    local tmp=$(mktemp -d); local pids=()
+
+    for i in $(seq 0 $((SERVER_COUNT - 1))); do
+        local host=${SERVERS[$i]} user=${SSH_USERS[$i]} port=${SSH_PORTS[$i]}
+        local rf="${tmp}/r_${i}"
+        (
+            ssh -p "$port" -o StrictHostKeyChecking=no "${user}@${host}" \
+                "bash ${remote_script}" &>/dev/null \
+                && echo "ok" > "$rf" || echo "fail" > "$rf"
+        ) &
+        pids+=($!)
+    done
+    run_parallel "${pids[@]}"
+
+    echo ""
+    for i in $(seq 0 $((SERVER_COUNT - 1))); do
+        local host=${SERVERS[$i]} user=${SSH_USERS[$i]}
+        local r=$(cat "${tmp}/r_${i}" 2>/dev/null || echo "fail")
+        [ "$r" = "ok" ] && ok "${user}@${host}" || fail "${user}@${host} — thất bại"
+    done
+    rm -rf "$tmp"
+}
+
+# =========================================
+# Function: menu script phụ
+# =========================================
 run_other_script() {
     while true; do
         echo ""
@@ -296,10 +337,10 @@ run_other_script() {
         echo ""
         read -p "  Chọn [1-5]: " s
         case "$s" in
-            1) run_remote_script "generate_moodle_db.sh" ;;
-            2) run_remote_script "check_moodle_db.sh" ;;
-            3) run_remote_script "main_restore.sh" ;;
-            4) run_remote_script "main_rollback.sh" ;;
+            1) run_remote_script "scripts/generate/generate_moodle_db.sh" ;;
+            2) run_remote_script "scripts/check/check_moodle_db.sh" ;;
+            3) run_remote_script "scripts/recovery/main_restore.sh" ;;
+            4) run_remote_script "scripts/recovery/main_rollback.sh" ;;
             5) break ;;
             *) warn "Nhập 1-5." ;;
         esac
