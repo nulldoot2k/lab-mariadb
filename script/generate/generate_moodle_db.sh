@@ -5,10 +5,6 @@
 #  Chạy: bash generate_moodle_db.sh
 # ============================================================
 
-CONTAINER="mariadb-104"
-MYSQL_USER="root"
-MYSQL_PASS="rootpassword"
-
 BATCH_USERS=10000
 BATCH_COURSES=1000
 BATCH_ENROL=50000
@@ -41,18 +37,86 @@ quit() {
 }
 
 # =========================================
-# Helper
+# Biến môi trường
 # =========================================
-mysql_exec() {
-  docker exec -i "$CONTAINER" \
-    mysql -u"$MYSQL_USER" -p"$MYSQL_PASS" 2>/dev/null
+ENV_MODE=""         # local | server
+RUNTIME=""          # docker | service
+SERVER_COUNT=0
+declare -a SERVERS=() SSH_USERS=() SSH_PORTS=()
+CONTAINER=""
+MYSQL_HOST="127.0.0.1"
+MYSQL_PORT=3306
+MYSQL_USER="root"
+MYSQL_PASS="rootpassword"
+
+# =========================================
+# Helper: chạy lệnh mysql trên 1 server (theo index)
+# =========================================
+mysql_exec_on() {
+  local idx=$1
+  # Ghi SQL vào file tạm — tránh vấn đề subshell & SSH stdin khi chạy song song
+  local sql_file
+  sql_file=$(mktemp /tmp/moodle_sql_XXXXXX)
+  cat > "$sql_file"
+
+  if [ "$RUNTIME" = "docker" ]; then
+    if [ "$ENV_MODE" = "server" ]; then
+      ssh -T -p "${SSH_PORTS[$idx]}" -o StrictHostKeyChecking=no \
+        "${SSH_USERS[$idx]}@${SERVERS[$idx]}" \
+        "docker exec -i $CONTAINER mysql -u\"$MYSQL_USER\" -p\"$MYSQL_PASS\" 2>/dev/null" \
+        < "$sql_file"
+    else
+      docker exec -i "$CONTAINER" \
+        mysql -u"$MYSQL_USER" -p"$MYSQL_PASS" 2>/dev/null < "$sql_file"
+    fi
+  else
+    if [ "$ENV_MODE" = "server" ]; then
+      ssh -T -p "${SSH_PORTS[$idx]}" -o StrictHostKeyChecking=no \
+        "${SSH_USERS[$idx]}@${SERVERS[$idx]}" \
+        "mysql -h\"$MYSQL_HOST\" -P\"$MYSQL_PORT\" -u\"$MYSQL_USER\" -p\"$MYSQL_PASS\" 2>/dev/null" \
+        < "$sql_file"
+    else
+      mysql -h"$MYSQL_HOST" -P"$MYSQL_PORT" \
+        -u"$MYSQL_USER" -p"$MYSQL_PASS" 2>/dev/null < "$sql_file"
+    fi
+  fi
+  rm -f "$sql_file"
 }
 
-mysql_q() {
-  docker exec "$CONTAINER" \
-    mysql -u"$MYSQL_USER" -p"$MYSQL_PASS" -N 2>/dev/null \
-    -e "$1"
+mysql_q_on() {
+  local idx=$1; local query=$2
+  # Dùng file tạm để tránh bash remote interpret backtick/special chars trong query
+  local sql_file
+  sql_file=$(mktemp /tmp/moodle_sql_XXXXXX)
+  echo "$query" > "$sql_file"
+
+  if [ "$RUNTIME" = "docker" ]; then
+    if [ "$ENV_MODE" = "server" ]; then
+      ssh -T -p "${SSH_PORTS[$idx]}" -o StrictHostKeyChecking=no \
+        "${SSH_USERS[$idx]}@${SERVERS[$idx]}" \
+        "docker exec -i $CONTAINER mysql -u\"$MYSQL_USER\" -p\"$MYSQL_PASS\" -N 2>/dev/null" \
+        < "$sql_file"
+    else
+      docker exec -i "$CONTAINER" \
+        mysql -u"$MYSQL_USER" -p"$MYSQL_PASS" -N 2>/dev/null < "$sql_file"
+    fi
+  else
+    if [ "$ENV_MODE" = "server" ]; then
+      ssh -T -p "${SSH_PORTS[$idx]}" -o StrictHostKeyChecking=no \
+        "${SSH_USERS[$idx]}@${SERVERS[$idx]}" \
+        "mysql -h\"$MYSQL_HOST\" -P\"$MYSQL_PORT\" -u\"$MYSQL_USER\" -p\"$MYSQL_PASS\" -N 2>/dev/null" \
+        < "$sql_file"
+    else
+      mysql -h"$MYSQL_HOST" -P"$MYSQL_PORT" \
+        -u"$MYSQL_USER" -p"$MYSQL_PASS" -N 2>/dev/null < "$sql_file"
+    fi
+  fi
+  rm -f "$sql_file"
 }
+
+# Alias cho local hoặc server đơn (idx=0)
+mysql_exec() { mysql_exec_on 0; }
+mysql_q()    { mysql_q_on 0 "$1"; }
 
 gen_uuid() {
   cat /proc/sys/kernel/random/uuid 2>/dev/null \
@@ -60,21 +124,193 @@ gen_uuid() {
 }
 
 # =========================================
-# Kiểm tra container
+# BƯỚC 1: Chọn môi trường
 # =========================================
-check_container() {
-  echo -e "  Kiểm tra container ${BOLD}${CONTAINER}${NC}..."
-  if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" != "true" ]; then
-    fail "Container '$CONTAINER' không đang chạy."; exit 1
-  fi
-  if ! mysql_q "SELECT 1;" &>/dev/null; then
-    fail "Không kết nối được MariaDB."; exit 1
-  fi
-  ok "Container ready."
+setup_env() {
+  while true; do
+    echo ""
+    echo -e "  ${BOLD}Môi trường thực thi${NC}"
+    sep
+    echo -e "  ${CYAN}1)${NC}  Local   — MariaDB đang chạy trên máy này"
+    echo -e "  ${CYAN}2)${NC}  Server  — MariaDB đang chạy trên server remote"
+    echo -e "  ${CYAN}q)${NC}  Thoát"
+    echo ""
+    read -rp "  Chọn [1/2/q]: " choice
+    case "$choice" in
+      1)
+        ENV_MODE="local"
+        SERVER_COUNT=1
+        SERVERS=("localhost"); SSH_USERS=(""); SSH_PORTS=("")
+        return 0
+        ;;
+      2)
+        ENV_MODE="server"
+        echo ""
+        read -rp "  Số lượng server: " count
+        if ! [[ "$count" =~ ^[0-9]+$ ]] || [ "$count" -lt 1 ]; then
+          warn "Nhập số >= 1."; continue
+        fi
+        SERVER_COUNT=$count
+        SERVERS=(); SSH_USERS=(); SSH_PORTS=()
+        echo ""
+        for i in $(seq 1 $SERVER_COUNT); do
+          echo -e "  ${CYAN}── Server #${i} ──${NC}"
+          read -rp "    Host IP / domain : " host
+          read -rp "    SSH User (root)  : " input; user=${input:-root}
+          read -rp "    SSH Port (22)    : " input; port=${input:-22}
+          SERVERS+=("$host"); SSH_USERS+=("$user"); SSH_PORTS+=("$port")
+          echo ""
+        done
+        # Check SSH song song
+        if ! check_ssh; then
+          return 1   # quay lại vòng lặp → hỏi lại từ đầu
+        fi
+        return 0
+        ;;
+      q|Q) quit ;;
+      *) warn "Nhập 1, 2 hoặc q." ;;
+    esac
+  done
 }
 
 # =========================================
-# Load DB hiện có
+# Check SSH song song
+# =========================================
+check_ssh() {
+  echo ""
+  echo -e "  Kiểm tra SSH ${SERVER_COUNT} server cùng lúc..."
+  local tmp=$(mktemp -d); local pids=()
+
+  for i in $(seq 0 $((SERVER_COUNT - 1))); do
+    (
+      ssh -p "${SSH_PORTS[$i]}" -o ConnectTimeout=5 -o BatchMode=yes \
+        -o StrictHostKeyChecking=no "${SSH_USERS[$i]}@${SERVERS[$i]}" \
+        "echo ok" &>/dev/null \
+        && echo "ok" > "${tmp}/r_${i}" || echo "fail" > "${tmp}/r_${i}"
+    ) &
+    pids+=($!)
+  done
+  for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+
+  echo ""
+  local all_ok=true
+  for i in $(seq 0 $((SERVER_COUNT - 1))); do
+    local r=$(cat "${tmp}/r_${i}" 2>/dev/null || echo "fail")
+    if [ "$r" = "ok" ]; then
+      ok "${SSH_USERS[$i]}@${SERVERS[$i]}:${SSH_PORTS[$i]}"
+    else
+      fail "${SSH_USERS[$i]}@${SERVERS[$i]}:${SSH_PORTS[$i]} — không kết nối được"
+      all_ok=false
+    fi
+  done
+  rm -rf "$tmp"
+
+  if [ "$all_ok" = false ]; then
+    echo ""
+    warn "Một số server không SSH được."
+    return 1
+  fi
+  return 0
+}
+
+# =========================================
+# BƯỚC 2: Chọn runtime + check
+# =========================================
+setup_runtime() {
+  while true; do
+    echo ""
+    echo -e "  ${BOLD}Loại runtime${NC}"
+    sep
+    echo -e "  ${CYAN}1)${NC}  Docker container"
+    echo -e "  ${CYAN}2)${NC}  Service (systemd / native)"
+    echo -e "  ${CYAN}b)${NC}  Quay lại"
+    echo ""
+    read -rp "  Chọn [1/2/b]: " choice
+    case "$choice" in
+      1)
+        RUNTIME="docker"
+        echo ""
+        read -rp "  Tên container (mariadb-104) : " input
+        CONTAINER=${input:-mariadb-104}
+        if check_runtime; then return 0; fi
+        ;;
+      2)
+        RUNTIME="service"
+        echo ""
+        read -rp "  MariaDB Host (127.0.0.1) : " input; MYSQL_HOST=${input:-127.0.0.1}
+        read -rp "  MariaDB Port (3306)      : " input; MYSQL_PORT=${input:-3306}
+        read -rp "  MySQL User   (root)      : " input; MYSQL_USER=${input:-root}
+        read -rp "  MySQL Pass               : " MYSQL_PASS
+        if check_runtime; then return 0; fi
+        ;;
+      b|B) return 1 ;;
+      *) warn "Nhập 1, 2 hoặc b." ;;
+    esac
+  done
+}
+
+# =========================================
+# Check runtime (container + MariaDB) song song
+# =========================================
+check_runtime() {
+  echo ""
+  local tmp=$(mktemp -d); local pids=()
+  local check_count=$SERVER_COUNT
+  [ "$ENV_MODE" = "local" ] && check_count=1
+
+  echo -e "  Kiểm tra runtime ${check_count} server cùng lúc..."
+
+  for i in $(seq 0 $((check_count - 1))); do
+    (
+      local result=""
+      # Check container tồn tại (nếu docker)
+      if [ "$RUNTIME" = "docker" ]; then
+        local running
+        if [ "$ENV_MODE" = "server" ]; then
+          running=$(ssh -p "${SSH_PORTS[$i]}" -o StrictHostKeyChecking=no \
+            "${SSH_USERS[$i]}@${SERVERS[$i]}" \
+            "docker inspect -f '{{.State.Running}}' $CONTAINER 2>/dev/null || echo NOT_FOUND")
+        else
+          running=$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || echo "NOT_FOUND")
+        fi
+        if [ "$running" = "NOT_FOUND" ]; then
+          echo "fail:container '$CONTAINER' không tồn tại" > "${tmp}/r_${i}"; exit 0
+        elif [ "$running" != "true" ]; then
+          echo "fail:container '$CONTAINER' không đang chạy" > "${tmp}/r_${i}"; exit 0
+        fi
+      fi
+
+      # Check MariaDB
+      if ! mysql_q_on "$i" "SELECT 1;" &>/dev/null; then
+        echo "fail:không kết nối được MariaDB" > "${tmp}/r_${i}"; exit 0
+      fi
+
+      echo "ok" > "${tmp}/r_${i}"
+    ) &
+    pids+=($!)
+  done
+  for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+
+  echo ""
+  local all_ok=true
+  for i in $(seq 0 $((check_count - 1))); do
+    local r=$(cat "${tmp}/r_${i}" 2>/dev/null || echo "fail:không có kết quả")
+    local label
+    [ "$ENV_MODE" = "server" ] && label="${SERVERS[$i]}" || label="local"
+    if [ "$r" = "ok" ]; then
+      ok "$label"
+    else
+      fail "$label — ${r#fail:}"
+      all_ok=false
+    fi
+  done
+  rm -rf "$tmp"
+
+  [ "$all_ok" = true ] && return 0 || return 1
+}
+
+# =========================================
+# Load DB + helpers (dùng server idx=0 làm reference)
 # =========================================
 load_databases() {
   mapfile -t EXISTING_DBS < <(
@@ -101,7 +337,7 @@ db_info() {
 }
 
 # =========================================
-# Bước 1: Menu chính
+# Menu gen data
 # =========================================
 ask_mode() {
   while true; do
@@ -122,15 +358,12 @@ ask_mode() {
   done
 }
 
-# =========================================
-# Bước 2a: Chọn DB có sẵn
-# =========================================
 select_existing() {
   load_databases
 
   if [ ${#EXISTING_DBS[@]} -eq 0 ]; then
     echo ""
-    warn "Chưa có DB nào trên server."
+    warn "Chưa có DB nào."
     echo ""
     read -rp "  Chuyển sang tạo DB mới? [y/b/q]: " ans
     case "$ans" in
@@ -142,7 +375,7 @@ select_existing() {
 
   while true; do
     echo ""
-    echo -e "  ${BOLD}DB hiện có trên ${CONTAINER}${NC}"
+    echo -e "  ${BOLD}DB hiện có${NC}"
     sep
     for i in "${!EXISTING_DBS[@]}"; do
       local dinfo
@@ -164,26 +397,20 @@ select_existing() {
     IFS=',' read -ra choices <<< "${input// /}"
     TARGET_DBS=()
     local valid=1
-
     for choice in "${choices[@]}"; do
       if [[ "$choice" =~ ^[0-9]+$ ]] && \
-         [ "$choice" -ge 1 ] && \
-         [ "$choice" -le "${#EXISTING_DBS[@]}" ]; then
+         [ "$choice" -ge 1 ] && [ "$choice" -le "${#EXISTING_DBS[@]}" ]; then
         TARGET_DBS+=("${EXISTING_DBS[$((choice-1))]}")
       else
         warn "'${choice}' không hợp lệ."; valid=0; break
       fi
     done
-
     [ "$valid" -eq 0 ] && continue
     mapfile -t TARGET_DBS < <(printf '%s\n' "${TARGET_DBS[@]}" | sort -u)
     [ "${#TARGET_DBS[@]}" -gt 0 ] && return 0
   done
 }
 
-# =========================================
-# Bước 2b: Tạo DB mới
-# =========================================
 select_new() {
   while true; do
     echo ""
@@ -199,13 +426,11 @@ select_new() {
       q|Q) quit ;;
     esac
 
-    if [[ "$input" =~ ^[0-9]+$ ]] && \
-       [ "$input" -ge 1 ] && [ "$input" -le 20 ]; then
+    if [[ "$input" =~ ^[0-9]+$ ]] && [ "$input" -ge 1 ] && [ "$input" -le 20 ]; then
       TARGET_DBS=()
       echo ""
       for (( i=0; i<input; i++ )); do
-        local uuid
-        uuid=$(gen_uuid)
+        local uuid; uuid=$(gen_uuid)
         TARGET_DBS+=("$uuid")
         info "$uuid"
       done
@@ -232,12 +457,11 @@ generate_seq() {
 }
 
 # =========================================
-# Setup tables
+# Setup tables + Insert data (cho 1 server theo idx)
 # =========================================
-setup_tables() {
-  local DB=$1
-  log "Setup tables..."
-  mysql_exec << SQL
+setup_tables_on() {
+  local idx=$1; local DB=$2
+  mysql_exec_on "$idx" << SQL
 CREATE DATABASE IF NOT EXISTS \`$DB\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 USE \`$DB\`;
 CREATE TABLE IF NOT EXISTS mdl_user (
@@ -305,14 +529,13 @@ CREATE TABLE IF NOT EXISTS mdl_message (
 SQL
 }
 
-# =========================================
-# Insert data
-# =========================================
-insert_data() {
-  local DB=$1
+insert_data_on() {
+  local idx=$1; local DB=$2
+  local label
+  [ "$ENV_MODE" = "server" ] && label="${SERVERS[$idx]}" || label="local"
 
-  log "Inserting $BATCH_USERS users..."
-  mysql_exec << SQL
+  echo "  [${label}] Inserting users..."
+  mysql_exec_on "$idx" << SQL
 USE \`$DB\`;
 INSERT INTO mdl_user (username, email, firstname, lastname, password, bio, city, country)
 SELECT
@@ -322,13 +545,12 @@ SELECT
   ELT(1+FLOOR(RAND()*5),'Van An','Thi Bich','Quoc Huy','Minh Duc','Thu Ha'),
   MD5(CONCAT('pass', seq, RAND())),
   REPEAT(CONCAT('Bio content ', seq, ' - Lorem ipsum dolor sit amet consectetur adipiscing elit. '), 5),
-  ELT(1+FLOOR(RAND()*3),'Hanoi','HCM','Danang'),
-  'VN'
+  ELT(1+FLOOR(RAND()*3),'Hanoi','HCM','Danang'), 'VN'
 FROM ($(generate_seq $BATCH_USERS)) t;
 SQL
 
-  log "Inserting $BATCH_COURSES courses..."
-  mysql_exec << SQL
+  echo "  [${label}] Inserting courses..."
+  mysql_exec_on "$idx" << SQL
 USE \`$DB\`;
 INSERT INTO mdl_course (fullname, shortname, summary, category, startdate, enddate)
 SELECT
@@ -341,93 +563,82 @@ SELECT
 FROM ($(generate_seq $BATCH_COURSES)) t;
 SQL
 
-  log "Caching MAX ids..."
-  MAX_USER=$(mysql_q "SELECT MAX(id) FROM \`${DB}\`.mdl_user;" | tr -d '[:space:]')
-  MAX_COURSE=$(mysql_q "SELECT MAX(id) FROM \`${DB}\`.mdl_course;" | tr -d '[:space:]')
-  log "MAX_USER=$MAX_USER  MAX_COURSE=$MAX_COURSE"
+  local MAX_USER MAX_COURSE
+  MAX_USER=$(mysql_q_on "$idx" "SELECT MAX(id) FROM \`${DB}\`.mdl_user;" | tr -d '[:space:]')
+  MAX_COURSE=$(mysql_q_on "$idx" "SELECT MAX(id) FROM \`${DB}\`.mdl_course;" | tr -d '[:space:]')
 
-  log "Inserting $BATCH_ENROL enrolments..."
-  mysql_exec << SQL
+  echo "  [${label}] Inserting enrolments..."
+  mysql_exec_on "$idx" << SQL
 USE \`$DB\`;
 INSERT INTO mdl_enrol (userid, courseid, status)
 SELECT FLOOR(RAND()*${MAX_USER})+1, FLOOR(RAND()*${MAX_COURSE})+1, FLOOR(RAND()*2)
 FROM ($(generate_seq $BATCH_ENROL)) t;
 SQL
 
-  log "Inserting $BATCH_FORUM forum posts..."
-  mysql_exec << SQL
+  echo "  [${label}] Inserting forum posts..."
+  mysql_exec_on "$idx" << SQL
 USE \`$DB\`;
 INSERT INTO mdl_forum_posts (userid, courseid, subject, message)
 SELECT
-  FLOOR(RAND()*${MAX_USER})+1,
-  FLOOR(RAND()*${MAX_COURSE})+1,
+  FLOOR(RAND()*${MAX_USER})+1, FLOOR(RAND()*${MAX_COURSE})+1,
   CONCAT('Post subject ', seq),
-  REPEAT(CONCAT('Forum content ', seq, ' - Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. '), 20)
+  REPEAT(CONCAT('Forum content ', seq, ' - Lorem ipsum dolor sit amet. '), 20)
 FROM ($(generate_seq $BATCH_FORUM)) t;
 SQL
 
-  log "Inserting $BATCH_GRADES grades..."
-  mysql_exec << SQL
+  echo "  [${label}] Inserting grades..."
+  mysql_exec_on "$idx" << SQL
 USE \`$DB\`;
 INSERT INTO mdl_grade_grades (userid, courseid, itemid, finalgrade, feedback)
 SELECT
-  FLOOR(RAND()*${MAX_USER})+1,
-  FLOOR(RAND()*${MAX_COURSE})+1,
-  FLOOR(RAND()*100)+1,
-  ROUND(RAND()*100, 2),
+  FLOOR(RAND()*${MAX_USER})+1, FLOOR(RAND()*${MAX_COURSE})+1,
+  FLOOR(RAND()*100)+1, ROUND(RAND()*100, 2),
   CONCAT('Feedback: ', REPEAT('Good performance. Keep it up. ', 5))
 FROM ($(generate_seq $BATCH_GRADES)) t;
 SQL
 
-  log "Inserting $BATCH_ASSIGN assignments..."
-  mysql_exec << SQL
+  echo "  [${label}] Inserting assignments..."
+  mysql_exec_on "$idx" << SQL
 USE \`$DB\`;
 INSERT INTO mdl_assign (userid, courseid, title, submission, grade, status)
 SELECT
-  FLOOR(RAND()*${MAX_USER})+1,
-  FLOOR(RAND()*${MAX_COURSE})+1,
+  FLOOR(RAND()*${MAX_USER})+1, FLOOR(RAND()*${MAX_COURSE})+1,
   CONCAT('Assignment ', seq, ': ', ELT(1+FLOOR(RAND()*4),'Essay','Report','Project','Lab Work')),
-  REPEAT(CONCAT('Submission content for assignment ', seq, '. Student work: Lorem ipsum dolor sit amet. '), 15),
+  REPEAT(CONCAT('Submission content for assignment ', seq, '. '), 15),
   ROUND(RAND()*100, 2),
   ELT(1+FLOOR(RAND()*3),'submitted','graded','draft')
 FROM ($(generate_seq $BATCH_ASSIGN)) t;
 SQL
 
-  log "Inserting $BATCH_QUIZ quiz attempts..."
-  mysql_exec << SQL
+  echo "  [${label}] Inserting quiz attempts..."
+  mysql_exec_on "$idx" << SQL
 USE \`$DB\`;
 INSERT INTO mdl_quiz (userid, courseid, quiz_name, score, max_score, attempt, time_taken)
 SELECT
-  FLOOR(RAND()*${MAX_USER})+1,
-  FLOOR(RAND()*${MAX_COURSE})+1,
+  FLOOR(RAND()*${MAX_USER})+1, FLOOR(RAND()*${MAX_COURSE})+1,
   CONCAT('Quiz ', seq, ': ', ELT(1+FLOOR(RAND()*4),'Midterm','Final','Chapter Test','Practice')),
-  ROUND(RAND()*10, 2),
-  10.00,
-  FLOOR(RAND()*3)+1,
-  FLOOR(RAND()*3600)+300
+  ROUND(RAND()*10, 2), 10.00, FLOOR(RAND()*3)+1, FLOOR(RAND()*3600)+300
 FROM ($(generate_seq $BATCH_QUIZ)) t;
 SQL
 
-  log "Inserting $BATCH_MESSAGE messages..."
-  mysql_exec << SQL
+  echo "  [${label}] Inserting messages..."
+  mysql_exec_on "$idx" << SQL
 USE \`$DB\`;
 INSERT INTO mdl_message (from_userid, to_userid, subject, body, is_read)
 SELECT
-  FLOOR(RAND()*${MAX_USER})+1,
-  FLOOR(RAND()*${MAX_USER})+1,
+  FLOOR(RAND()*${MAX_USER})+1, FLOOR(RAND()*${MAX_USER})+1,
   CONCAT('Message ', seq, ': ', ELT(1+FLOOR(RAND()*4),'Question','Feedback','Announcement','Reminder')),
-  REPEAT(CONCAT('Message body ', seq, ' - Dear student, please note that Lorem ipsum dolor sit amet. '), 5),
+  REPEAT(CONCAT('Message body ', seq, ' - Dear student. '), 5),
   FLOOR(RAND()*2)
 FROM ($(generate_seq $BATCH_MESSAGE)) t;
 SQL
 
-  log "Inserting $BATCH_LOGS logs..."
-  mysql_exec << SQL
+  echo "  [${label}] Inserting logs..."
+  mysql_exec_on "$idx" << SQL
 USE \`$DB\`;
 INSERT INTO mdl_logstore (userid, courseid, action, target, ip, data)
 SELECT
-  FLOOR(RAND()*${MAX_USER})+1,
-  FLOOR(RAND()*${MAX_COURSE})+1,
+  FLOOR(RAND()*${MAX_USER})+1, FLOOR(RAND()*${MAX_COURSE})+1,
   ELT(1+FLOOR(RAND()*4),'viewed','created','updated','deleted'),
   ELT(1+FLOOR(RAND()*5),'course','user','forum','grade','assign'),
   CONCAT(FLOOR(RAND()*255),'.',FLOOR(RAND()*255),'.',FLOOR(RAND()*255),'.',FLOOR(RAND()*255)),
@@ -435,7 +646,31 @@ SELECT
 FROM ($(generate_seq $BATCH_LOGS)) t;
 SQL
 
-  ok "Done: $DB"
+  ok "[${label}] Done: $DB"
+}
+
+# =========================================
+# Chạy gen song song trên tất cả server
+# =========================================
+run_gen_parallel() {
+  local DB=$1
+  local run_count=$SERVER_COUNT
+  [ "$ENV_MODE" = "local" ] && run_count=1
+
+  echo ""
+  sep
+  echo -e "  ${BOLD}DB:${NC} $DB  (${run_count} server song song)"
+  sep
+
+  local pids=()
+  for i in $(seq 0 $((run_count - 1))); do
+    (
+      setup_tables_on "$i" "$DB"
+      insert_data_on  "$i" "$DB"
+    ) &
+    pids+=($!)
+  done
+  for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
 }
 
 # =========================================
@@ -443,11 +678,38 @@ SQL
 # =========================================
 echo ""
 echo -e "${BOLD}  Moodle Data Generator${NC}"
-dim   "  Container: ${CONTAINER}"
 echo ""
 
-check_container
+# Bước 1: Môi trường (loop cho đến khi ok)
+while true; do
+  setup_env && break
+done
 
+# Bước 2: Runtime (b → quay lại chọn env)
+while true; do
+  setup_runtime && break
+  # Nếu chọn b → quay lại chọn env
+  while true; do
+    setup_env && break
+  done
+done
+
+# Tóm tắt
+echo ""
+sep
+if [ "$ENV_MODE" = "local" ]; then
+  info "Môi trường : Local"
+else
+  for i in $(seq 0 $((SERVER_COUNT - 1))); do
+    info "Server #$((i+1))  : ${SSH_USERS[$i]}@${SERVERS[$i]}:${SSH_PORTS[$i]}"
+  done
+fi
+[ "$RUNTIME" = "docker" ] \
+  && info "Runtime    : Docker  (container: $CONTAINER)" \
+  || info "Runtime    : Service (${MYSQL_HOST}:${MYSQL_PORT})"
+sep
+
+# Bước 3: Menu gen data
 while true; do
   ask_mode
 
@@ -459,17 +721,11 @@ while true; do
 
     [ "$step2" -eq 1 ] && break
 
-    # Chạy gen
     echo ""
     echo -e "  ${BOLD}Started: $(date '+%Y-%m-%d %H:%M:%S')${NC}"
 
     for DB in "${TARGET_DBS[@]}"; do
-      echo ""
-      sep
-      echo -e "  ${BOLD}DB:${NC} $DB"
-      sep
-      setup_tables "$DB"
-      insert_data  "$DB"
+      run_gen_parallel "$DB"
     done
 
     echo ""

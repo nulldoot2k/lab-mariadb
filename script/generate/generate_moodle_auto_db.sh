@@ -2,13 +2,8 @@
 
 # ============================================================
 #  AUTO ACTIVITY GENERATOR — Moodle
-#  Chạy: bash insert_auto.sh
-#  → Tự detect DB từ MariaDB, hỏi chọn rồi bắt đầu insert
+#  Chạy: bash generate_moodle_auto_db.sh
 # ============================================================
-
-CONTAINER="mariadb-104"
-MYSQL_USER="root"
-MYSQL_PASS="rootpassword"
 
 INTERVAL=5
 USERS_PER_TICK=5
@@ -17,169 +12,385 @@ USERS_PER_TICK=5
 # Colors
 # =========================================
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
 
-ok()   { echo -e "  ${GREEN}✔ $1${NC}"; }
-fail() { echo -e "  ${RED}✘ $1${NC}"; }
-warn() { echo -e "  ${YELLOW}⚠ $1${NC}"; }
-info() { echo -e "  ${CYAN}ℹ $1${NC}"; }
+ok()   { echo -e "  ${GREEN}✔${NC} $1"; }
+fail() { echo -e "  ${RED}✘${NC} $1"; }
+warn() { echo -e "  ${YELLOW}⚠${NC}  $1"; }
+info() { echo -e "  ${CYAN}→${NC} $1"; }
+dim()  { echo -e "  ${DIM}$1${NC}"; }
+sep()  { echo -e "  ${DIM}────────────────────────────────────────${NC}"; }
 
-# =========================================
-# Helper
-# =========================================
-mysql_exec() {
-  docker exec -i "$CONTAINER" \
-    mysql -u"$MYSQL_USER" -p"$MYSQL_PASS" -N 2>/dev/null
-}
-
-mysql_q() {
-  docker exec "$CONTAINER" \
-    mysql -u"$MYSQL_USER" -p"$MYSQL_PASS" -N 2>/dev/null \
-    -e "$1"
-}
-
-get_max() {
-  mysql_q "SELECT COALESCE(MAX(id),0) FROM \`$1\`.\`$2\`;" | tr -d '[:space:]'
-}
-
-# =========================================
-# Kiểm tra container + kết nối
-# =========================================
-check_container() {
-  echo -e "  Kiểm tra container ${BOLD}${CONTAINER}${NC}..."
-
-  if ! docker inspect "$CONTAINER" &>/dev/null; then
-    fail "Container '${CONTAINER}' không tồn tại."; exit 1
-  fi
-  if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" != "true" ]; then
-    fail "Container '${CONTAINER}' không đang chạy."; exit 1
-  fi
-  if ! mysql_q "SELECT 1;" &>/dev/null; then
-    fail "Không kết nối được MariaDB — kiểm tra user/pass."; exit 1
-  fi
-
-  ok "Container ready."
-}
-
-# =========================================
-# Load danh sách DB từ MariaDB
-# Lọc bỏ các system DB
-# =========================================
-load_databases() {
-  echo -e "  Đang load danh sách DB từ MariaDB..."
-
-  mapfile -t ALL_DATABASES < <(
-    mysql_q "SELECT schema_name
-             FROM information_schema.schemata
-             WHERE schema_name NOT IN (
-               'information_schema','performance_schema',
-               'mysql','sys','innodb'
-             )
-             ORDER BY schema_name;"
-  )
-
-  if [ ${#ALL_DATABASES[@]} -eq 0 ]; then
-    fail "Không tìm thấy DB nào (ngoài system DB)."; exit 1
-  fi
-
-  ok "Tìm thấy ${#ALL_DATABASES[@]} DB."
-}
-
-# =========================================
-# Hiển thị info nhanh từng DB (user/course count)
-# =========================================
-db_info() {
-  local DB=$1
-  local mu mc
-  mu=$(get_max "$DB" "mdl_user"   2>/dev/null || echo "?")
-  mc=$(get_max "$DB" "mdl_course" 2>/dev/null || echo "?")
-  # Chỉ show nếu có mdl_user
-  if [[ "$mu" =~ ^[0-9]+$ ]] && [ "$mu" -gt 0 ]; then
-    echo "users≈${mu}  courses≈${mc}"
-  else
-    echo "chưa có data Moodle"
-  fi
-}
-
-# =========================================
-# Hỏi chọn DB — load động từ server
-# =========================================
-select_db() {
+quit() {
   echo ""
-  echo -e "${BOLD}  ┌─ Danh sách DB trên ${CONTAINER} ─────────────────────┐${NC}"
-
-  # Hiển thị từng DB kèm info
-  for i in "${!ALL_DATABASES[@]}"; do
-    local DB="${ALL_DATABASES[$i]}"
-    local info
-    info=$(db_info "$DB")
-    printf "  │  ${CYAN}%2d)${NC}  %-38s  ${YELLOW}%s${NC}\n" \
-      "$((i+1))" "$DB" "$info"
-  done
-
-  echo -e "${BOLD}  │${NC}"
-  printf   "  │  ${CYAN}%2s)${NC}  %s\n" "0" "Tất cả (${#ALL_DATABASES[@]} DB)"
-  echo -e "${BOLD}  └─────────────────────────────────────────────────────┘${NC}"
+  dim "Thoát."
   echo ""
+  exit 0
+}
 
-  while true; do
-    read -rp "  Nhập số [0-${#ALL_DATABASES[@]}]: " choice
-    if [[ "$choice" == "0" ]]; then
-      SELECTED_DBS=("${ALL_DATABASES[@]}")
-      break
-    elif [[ "$choice" =~ ^[0-9]+$ ]] && \
-         [ "$choice" -ge 1 ] && \
-         [ "$choice" -le "${#ALL_DATABASES[@]}" ]; then
-      SELECTED_DBS=("${ALL_DATABASES[$((choice-1))]}")
-      break
+# =========================================
+# Biến môi trường
+# =========================================
+ENV_MODE=""
+RUNTIME=""
+SERVER_COUNT=0
+declare -a SERVERS=() SSH_USERS=() SSH_PORTS=()
+CONTAINER=""
+MYSQL_HOST="127.0.0.1"
+MYSQL_PORT=3306
+MYSQL_USER="root"
+MYSQL_PASS="rootpassword"
+
+# =========================================
+# Helper: mysql exec (stdin) — file tạm
+# =========================================
+mysql_exec_on() {
+  local idx=$1
+  local sql_file
+  sql_file=$(mktemp /tmp/moodle_sql_XXXXXX)
+  cat > "$sql_file"
+
+  if [ "$RUNTIME" = "docker" ]; then
+    if [ "$ENV_MODE" = "server" ]; then
+      ssh -T -p "${SSH_PORTS[$idx]}" -o StrictHostKeyChecking=no \
+        "${SSH_USERS[$idx]}@${SERVERS[$idx]}" \
+        "docker exec -i $CONTAINER mysql -u\"$MYSQL_USER\" -p\"$MYSQL_PASS\" 2>/dev/null" \
+        < "$sql_file"
     else
-      warn "Nhập số từ 0 đến ${#ALL_DATABASES[@]}."
+      docker exec -i "$CONTAINER" \
+        mysql -u"$MYSQL_USER" -p"$MYSQL_PASS" 2>/dev/null < "$sql_file"
     fi
-  done
+  else
+    if [ "$ENV_MODE" = "server" ]; then
+      ssh -T -p "${SSH_PORTS[$idx]}" -o StrictHostKeyChecking=no \
+        "${SSH_USERS[$idx]}@${SERVERS[$idx]}" \
+        "mysql -h\"$MYSQL_HOST\" -P\"$MYSQL_PORT\" -u\"$MYSQL_USER\" -p\"$MYSQL_PASS\" 2>/dev/null" \
+        < "$sql_file"
+    else
+      mysql -h"$MYSQL_HOST" -P"$MYSQL_PORT" \
+        -u"$MYSQL_USER" -p"$MYSQL_PASS" 2>/dev/null < "$sql_file"
+    fi
+  fi
+  rm -f "$sql_file"
+}
 
-  echo ""
-  info "Đã chọn ${#SELECTED_DBS[@]} DB:"
-  for DB in "${SELECTED_DBS[@]}"; do
-    info "  → $DB"
+# =========================================
+# Helper: mysql query (single value) — file tạm
+# =========================================
+mysql_q_on() {
+  local idx=$1; local query=$2
+  local sql_file
+  sql_file=$(mktemp /tmp/moodle_sql_XXXXXX)
+  echo "$query" > "$sql_file"
+
+  if [ "$RUNTIME" = "docker" ]; then
+    if [ "$ENV_MODE" = "server" ]; then
+      ssh -T -p "${SSH_PORTS[$idx]}" -o StrictHostKeyChecking=no \
+        "${SSH_USERS[$idx]}@${SERVERS[$idx]}" \
+        "docker exec -i $CONTAINER mysql -u\"$MYSQL_USER\" -p\"$MYSQL_PASS\" -N 2>/dev/null" \
+        < "$sql_file"
+    else
+      docker exec -i "$CONTAINER" \
+        mysql -u"$MYSQL_USER" -p"$MYSQL_PASS" -N 2>/dev/null < "$sql_file"
+    fi
+  else
+    if [ "$ENV_MODE" = "server" ]; then
+      ssh -T -p "${SSH_PORTS[$idx]}" -o StrictHostKeyChecking=no \
+        "${SSH_USERS[$idx]}@${SERVERS[$idx]}" \
+        "mysql -h\"$MYSQL_HOST\" -P\"$MYSQL_PORT\" -u\"$MYSQL_USER\" -p\"$MYSQL_PASS\" -N 2>/dev/null" \
+        < "$sql_file"
+    else
+      mysql -h"$MYSQL_HOST" -P"$MYSQL_PORT" \
+        -u"$MYSQL_USER" -p"$MYSQL_PASS" -N 2>/dev/null < "$sql_file"
+    fi
+  fi
+  rm -f "$sql_file"
+}
+
+get_max_on() {
+  local idx=$1 DB=$2 TBL=$3
+  mysql_q_on "$idx" "SELECT COALESCE(MAX(id),0) FROM \`$DB\`.\`$TBL\`;" | tr -d '[:space:]'
+}
+
+# =========================================
+# BƯỚC 1: Chọn môi trường
+# =========================================
+setup_env() {
+  while true; do
+    echo ""
+    echo -e "  ${BOLD}Môi trường thực thi${NC}"
+    sep
+    echo -e "  ${CYAN}1)${NC}  Local   — MariaDB đang chạy trên máy này"
+    echo -e "  ${CYAN}2)${NC}  Server  — MariaDB đang chạy trên server remote"
+    echo -e "  ${CYAN}q)${NC}  Thoát"
+    echo ""
+    read -rp "  Chọn [1/2/q]: " choice
+    case "$choice" in
+      1)
+        ENV_MODE="local"
+        SERVER_COUNT=1
+        SERVERS=("localhost"); SSH_USERS=(""); SSH_PORTS=("")
+        return 0 ;;
+      2)
+        ENV_MODE="server"
+        echo ""
+        read -rp "  Số lượng server: " count
+        if ! [[ "$count" =~ ^[0-9]+$ ]] || [ "$count" -lt 1 ]; then
+          warn "Nhập số >= 1."; continue
+        fi
+        SERVER_COUNT=$count
+        SERVERS=(); SSH_USERS=(); SSH_PORTS=()
+        echo ""
+        for i in $(seq 1 $SERVER_COUNT); do
+          echo -e "  ${CYAN}── Server #${i} ──${NC}"
+          read -rp "    Host IP / domain : " host
+          read -rp "    SSH User (root)  : " input; user=${input:-root}
+          read -rp "    SSH Port (22)    : " input; port=${input:-22}
+          SERVERS+=("$host"); SSH_USERS+=("$user"); SSH_PORTS+=("$port")
+          echo ""
+        done
+        if ! check_ssh; then return 1; fi
+        return 0 ;;
+      q|Q) quit ;;
+      *) warn "Nhập 1, 2 hoặc q." ;;
+    esac
   done
 }
 
 # =========================================
-# Kiểm tra DB được chọn có data Moodle không
+# Check SSH song song
+# =========================================
+check_ssh() {
+  echo ""
+  echo -e "  Kiểm tra SSH ${SERVER_COUNT} server cùng lúc..."
+  local tmp=$(mktemp -d); local pids=()
+  for i in $(seq 0 $((SERVER_COUNT - 1))); do
+    (
+      ssh -p "${SSH_PORTS[$i]}" -o ConnectTimeout=5 -o BatchMode=yes \
+        -o StrictHostKeyChecking=no "${SSH_USERS[$i]}@${SERVERS[$i]}" \
+        "echo ok" &>/dev/null \
+        && echo "ok" > "${tmp}/r_${i}" || echo "fail" > "${tmp}/r_${i}"
+    ) &
+    pids+=($!)
+  done
+  for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+  echo ""
+  local all_ok=true
+  for i in $(seq 0 $((SERVER_COUNT - 1))); do
+    local r=$(cat "${tmp}/r_${i}" 2>/dev/null || echo "fail")
+    [ "$r" = "ok" ] \
+      && ok "${SSH_USERS[$i]}@${SERVERS[$i]}:${SSH_PORTS[$i]}" \
+      || { fail "${SSH_USERS[$i]}@${SERVERS[$i]}:${SSH_PORTS[$i]} — không kết nối được"; all_ok=false; }
+  done
+  rm -rf "$tmp"
+  [ "$all_ok" = true ] && return 0 || { echo ""; warn "Một số server không SSH được."; return 1; }
+}
+
+# =========================================
+# BƯỚC 2: Chọn runtime + check
+# =========================================
+setup_runtime() {
+  while true; do
+    echo ""
+    echo -e "  ${BOLD}Loại runtime${NC}"
+    sep
+    echo -e "  ${CYAN}1)${NC}  Docker container"
+    echo -e "  ${CYAN}2)${NC}  Service (systemd / native)"
+    echo -e "  ${CYAN}b)${NC}  Quay lại"
+    echo ""
+    read -rp "  Chọn [1/2/b]: " choice
+    case "$choice" in
+      1)
+        RUNTIME="docker"
+        echo ""
+        read -rp "  Tên container (mariadb-104) : " input
+        CONTAINER=${input:-mariadb-104}
+        if check_runtime; then return 0; fi ;;
+      2)
+        RUNTIME="service"
+        echo ""
+        read -rp "  MariaDB Host (127.0.0.1) : " input; MYSQL_HOST=${input:-127.0.0.1}
+        read -rp "  MariaDB Port (3306)      : " input; MYSQL_PORT=${input:-3306}
+        read -rp "  MySQL User   (root)      : " input; MYSQL_USER=${input:-root}
+        read -rp "  MySQL Pass               : " MYSQL_PASS
+        if check_runtime; then return 0; fi ;;
+      b|B) return 1 ;;
+      *) warn "Nhập 1, 2 hoặc b." ;;
+    esac
+  done
+}
+
+# =========================================
+# Check runtime song song
+# =========================================
+check_runtime() {
+  echo ""
+  local check_count=$SERVER_COUNT
+  [ "$ENV_MODE" = "local" ] && check_count=1
+  local tmp=$(mktemp -d); local pids=()
+  echo -e "  Kiểm tra runtime ${check_count} server cùng lúc..."
+  for i in $(seq 0 $((check_count - 1))); do
+    (
+      if [ "$RUNTIME" = "docker" ]; then
+        local running
+        if [ "$ENV_MODE" = "server" ]; then
+          running=$(ssh -p "${SSH_PORTS[$i]}" -o StrictHostKeyChecking=no \
+            "${SSH_USERS[$i]}@${SERVERS[$i]}" \
+            "docker inspect -f '{{.State.Running}}' $CONTAINER 2>/dev/null || echo NOT_FOUND")
+        else
+          running=$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || echo "NOT_FOUND")
+        fi
+        [ "$running" = "NOT_FOUND" ] && { echo "fail:container '$CONTAINER' không tồn tại" > "${tmp}/r_${i}"; exit 0; }
+        [ "$running" != "true" ]     && { echo "fail:container '$CONTAINER' không đang chạy" > "${tmp}/r_${i}"; exit 0; }
+      fi
+      if ! mysql_q_on "$i" "SELECT 1;" &>/dev/null; then
+        echo "fail:không kết nối được MariaDB" > "${tmp}/r_${i}"; exit 0
+      fi
+      echo "ok" > "${tmp}/r_${i}"
+    ) &
+    pids+=($!)
+  done
+  for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+  echo ""
+  local all_ok=true
+  for i in $(seq 0 $((check_count - 1))); do
+    local r=$(cat "${tmp}/r_${i}" 2>/dev/null || echo "fail:không có kết quả")
+    local label; [ "$ENV_MODE" = "server" ] && label="${SERVERS[$i]}" || label="local"
+    [ "$r" = "ok" ] && ok "$label" || { fail "$label — ${r#fail:}"; all_ok=false; }
+  done
+  rm -rf "$tmp"
+  [ "$all_ok" = true ] && return 0 || return 1
+}
+
+# =========================================
+# Load DB của 1 server
+# =========================================
+load_databases_on() {
+  local idx=$1
+  mysql_q_on "$idx" "SELECT schema_name
+           FROM information_schema.schemata
+           WHERE schema_name NOT IN (
+             'information_schema','performance_schema',
+             'mysql','sys','innodb'
+           )
+           ORDER BY schema_name;"
+}
+
+# =========================================
+# Chọn DB — lần lượt từng server
+# SERVER_SELECTED_DBS[i] = "db1|db2|..." (pipe-separated)
+# =========================================
+select_dbs() {
+  local run_count=$SERVER_COUNT
+  [ "$ENV_MODE" = "local" ] && run_count=1
+  declare -g -a SERVER_SELECTED_DBS=()
+
+  for i in $(seq 0 $((run_count - 1))); do
+    local label
+    [ "$ENV_MODE" = "server" ] && label="${SERVERS[$i]}" || label="local"
+
+    mapfile -t DBS_ON_SERVER < <(load_databases_on "$i" 2>/dev/null)
+
+    if [ ${#DBS_ON_SERVER[@]} -eq 0 ]; then
+      warn "Server ${label} không có DB nào — bỏ qua."
+      SERVER_SELECTED_DBS+=(""); continue
+    fi
+
+    while true; do
+      echo ""
+      echo -e "  ${BOLD}[Server: ${CYAN}${label}${NC}${BOLD}]${NC}  Chọn DB để chạy auto"
+      sep
+      for j in "${!DBS_ON_SERVER[@]}"; do
+        local db="${DBS_ON_SERVER[$j]}"
+        local mu mc
+        mu=$(get_max_on "$i" "$db" "mdl_user" 2>/dev/null || echo "?")
+        mc=$(get_max_on "$i" "$db" "mdl_course" 2>/dev/null || echo "?")
+        if [[ "$mu" =~ ^[0-9]+$ ]] && [ "$mu" -gt 0 ]; then
+          printf "  ${CYAN}%2d)${NC}  %-38s  ${YELLOW}users≈%s  courses≈%s${NC}\n" \
+            "$((j+1))" "$db" "$mu" "$mc"
+        else
+          printf "  ${CYAN}%2d)${NC}  %-38s  ${DIM}chưa có data${NC}\n" "$((j+1))" "$db"
+        fi
+      done
+      echo -e "  ${CYAN} 0)${NC}  Tất cả"
+      echo ""
+      dim "  Chọn 1 hoặc nhiều, cách nhau bởi dấu phẩy. Vd: 1,2"
+      dim "  q) Thoát"
+      echo ""
+      read -rp "  Nhập [0-${#DBS_ON_SERVER[@]}/q]: " input
+
+      case "${input// /}" in
+        q|Q) quit ;;
+        0)
+          local joined; joined=$(printf '%s|' "${DBS_ON_SERVER[@]}")
+          SERVER_SELECTED_DBS+=("${joined%|}")
+          break ;;
+      esac
+
+      IFS=',' read -ra choices <<< "${input// /}"
+      local picked=() valid=1
+      for choice in "${choices[@]}"; do
+        if [[ "$choice" =~ ^[0-9]+$ ]] && \
+           [ "$choice" -ge 1 ] && [ "$choice" -le "${#DBS_ON_SERVER[@]}" ]; then
+          picked+=("${DBS_ON_SERVER[$((choice-1))]}")
+        else
+          warn "'${choice}' không hợp lệ."; valid=0; break
+        fi
+      done
+      [ "$valid" -eq 0 ] && continue
+      mapfile -t picked < <(printf '%s\n' "${picked[@]}" | sort -u)
+      if [ ${#picked[@]} -gt 0 ]; then
+        local joined; joined=$(printf '%s|' "${picked[@]}")
+        SERVER_SELECTED_DBS+=("${joined%|}")
+        break
+      fi
+    done
+  done
+}
+
+# =========================================
+# Kiểm tra DB có data Moodle không
 # =========================================
 check_selected() {
+  local run_count=$SERVER_COUNT
+  [ "$ENV_MODE" = "local" ] && run_count=1
   local all_ok=1
   echo ""
-  for DB in "${SELECTED_DBS[@]}"; do
-    local mu mc
-    mu=$(get_max "$DB" "mdl_user")
-    mc=$(get_max "$DB" "mdl_course")
-    if [[ "${mu:-0}" -le 0 ]] || [[ "${mc:-0}" -le 0 ]]; then
-      warn "DB ${DB:0:8}…  chưa có data — chạy generate_moodle_db.sh trước."
-      all_ok=0
-    else
-      ok "DB ${DB:0:8}…  users=${mu}  courses=${mc}  ✓"
-    fi
+  for i in $(seq 0 $((run_count - 1))); do
+    local label; [ "$ENV_MODE" = "server" ] && label="${SERVERS[$i]}" || label="local"
+    local db_str="${SERVER_SELECTED_DBS[$i]:-}"
+    [ -z "$db_str" ] && continue
+    IFS='|' read -ra DBS <<< "$db_str"
+    for DB in "${DBS[@]}"; do
+      local mu mc
+      mu=$(get_max_on "$i" "$DB" "mdl_user")
+      mc=$(get_max_on "$i" "$DB" "mdl_course")
+      if [[ "${mu:-0}" -le 0 ]] || [[ "${mc:-0}" -le 0 ]]; then
+        warn "[${label}] DB ${DB:0:12}…  chưa có data — chạy generate_moodle_db.sh trước."
+        all_ok=0
+      else
+        ok "[${label}] DB ${DB:0:12}…  users=${mu}  courses=${mc}"
+      fi
+    done
   done
   [ "$all_ok" -eq 0 ] && exit 1
 }
 
 # =========================================
-# 1 tick — toàn bộ trong 1 connection
+# 1 tick — insert activity cho 1 server/DB
 # =========================================
-do_tick() {
-  local DB=$1
+do_tick_on() {
+  local idx=$1; local DB=$2
   local MU MC
-  MU=$(get_max "$DB" "mdl_user")
-  MC=$(get_max "$DB" "mdl_course")
+  MU=$(get_max_on "$idx" "$DB" "mdl_user")
+  MC=$(get_max_on "$idx" "$DB" "mdl_course")
 
-  [ "${MU:-0}" -le 0 ] && { warn "Không có user trong ${DB:0:8}…"; return 1; }
-  [ "${MC:-0}" -le 0 ] && { warn "Không có course trong ${DB:0:8}…"; return 1; }
+  [ "${MU:-0}" -le 0 ] && { warn "Không có user trong ${DB:0:12}…"; return 1; }
+  [ "${MC:-0}" -le 0 ] && { warn "Không có course trong ${DB:0:12}…"; return 1; }
 
-  mysql_exec << SQL
+  mysql_exec_on "$idx" << SQL
 USE \`${DB}\`;
 
--- 1. VIEW events
 INSERT INTO mdl_logstore (userid, courseid, action, target, ip, data, created_at)
 SELECT
   FLOOR(RAND()*${MU})+1,
@@ -193,7 +404,6 @@ FROM (SELECT 1 n UNION ALL SELECT 2 UNION ALL SELECT 3
       UNION ALL SELECT 4 UNION ALL SELECT 5) g
 LIMIT ${USERS_PER_TICK};
 
--- 2. Login/logout
 INSERT INTO mdl_logstore (userid, courseid, action, target, ip, data, created_at)
 SELECT
   FLOOR(RAND()*${MU})+1,
@@ -205,7 +415,6 @@ SELECT
   NOW()
 FROM (SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3) g;
 
--- 3. Forum post
 INSERT INTO mdl_forum_posts (userid, courseid, subject, message, created_at)
 SELECT
   FLOOR(RAND()*${MU})+1,
@@ -220,7 +429,6 @@ SELECT
   NOW()
 FROM (SELECT 1 UNION ALL SELECT 2) g;
 
--- 4. Assignment
 INSERT INTO mdl_assign (userid, courseid, title, submission, grade, status, submitted_at)
 SELECT
   FLOOR(RAND()*${MU})+1,
@@ -233,7 +441,6 @@ SELECT
   NOW()
 FROM (SELECT 1 UNION ALL SELECT 2) g;
 
--- 5. Quiz
 INSERT INTO mdl_quiz (userid, courseid, quiz_name, score, max_score, attempt, time_taken, started_at)
 SELECT
   FLOOR(RAND()*${MU})+1,
@@ -246,7 +453,6 @@ SELECT
   NOW()
 FROM (SELECT 1 UNION ALL SELECT 2) g;
 
--- 6. Message
 INSERT INTO mdl_message (from_userid, to_userid, subject, body, is_read, sent_at)
 SELECT
   FLOOR(RAND()*${MU})+1,
@@ -262,31 +468,27 @@ SELECT
   NOW()
 FROM (SELECT 1 UNION ALL SELECT 2) g;
 
--- 7. Grade update — dùng id range, không ORDER BY RAND()
 SET @gmax := (SELECT MAX(id) FROM mdl_grade_grades);
 UPDATE mdl_grade_grades
 SET finalgrade = ROUND(RAND()*100,2),
     feedback   = CONCAT('Auto-graded ',DATE_FORMAT(NOW(),'%Y-%m-%d %H:%i:%s')),
     created_at = NOW()
-WHERE id BETWEEN FLOOR(RAND()*@gmax)+1
-              AND FLOOR(RAND()*@gmax)+4;
+WHERE id BETWEEN FLOOR(RAND()*@gmax)+1 AND FLOOR(RAND()*@gmax)+4;
 
--- 8. Enrol status — tương tự
 SET @emax := (SELECT MAX(id) FROM mdl_enrol);
 UPDATE mdl_enrol
 SET status      = FLOOR(RAND()*2),
     enrolled_at = NOW()
-WHERE id BETWEEN FLOOR(RAND()*@emax)+1
-              AND FLOOR(RAND()*@emax)+3;
+WHERE id BETWEEN FLOOR(RAND()*@emax)+1 AND FLOOR(RAND()*@emax)+3;
 SQL
 }
 
 # =========================================
-# Quick count dùng information_schema (O(1))
+# Quick count activity rows
 # =========================================
-quick_count() {
-  local DB=$1
-  mysql_q "SELECT COALESCE(SUM(table_rows),0)
+quick_count_on() {
+  local idx=$1; local DB=$2
+  mysql_q_on "$idx" "SELECT COALESCE(SUM(table_rows),0)
            FROM information_schema.tables
            WHERE table_schema='${DB}'
              AND table_name IN (
@@ -296,7 +498,7 @@ quick_count() {
 }
 
 # =========================================
-# Trap Ctrl+C
+# Trap Ctrl+C — summary
 # =========================================
 TICK=0
 START_TS=$(date +%s)
@@ -304,6 +506,9 @@ START_TS=$(date +%s)
 cleanup() {
   echo ""
   local ELAPSED=$(( $(date +%s) - START_TS ))
+  local run_count=$SERVER_COUNT
+  [ "$ENV_MODE" = "local" ] && run_count=1
+
   echo ""
   echo -e "${BOLD}╔══════════════════════════════════════════════════════╗${NC}"
   echo -e "${BOLD}  Dừng — Summary${NC}"
@@ -311,9 +516,15 @@ cleanup() {
     $((ELAPSED/3600)) $((ELAPSED%3600/60)) $((ELAPSED%60))
   echo     "  Tổng tick : ${TICK}"
   echo ""
-  for DB in "${SELECTED_DBS[@]}"; do
-    TOTAL=$(quick_count "$DB")
-    echo "  DB ${DB:0:8}…  activity rows ≈ ${TOTAL:-?}"
+  for i in $(seq 0 $((run_count - 1))); do
+    local label; [ "$ENV_MODE" = "server" ] && label="${SERVERS[$i]}" || label="local"
+    local db_str="${SERVER_SELECTED_DBS[$i]:-}"
+    [ -z "$db_str" ] && continue
+    IFS='|' read -ra DBS <<< "$db_str"
+    for DB in "${DBS[@]}"; do
+      local total; total=$(quick_count_on "$i" "$DB")
+      echo "  [${label}] DB ${DB:0:12}…  activity rows ≈ ${total:-?}"
+    done
   done
   echo -e "${BOLD}╚══════════════════════════════════════════════════════╝${NC}"
   echo ""
@@ -327,31 +538,77 @@ trap cleanup INT TERM
 echo ""
 echo -e "${BOLD}╔══════════════════════════════════════════════════════╗${NC}"
 echo -e "${BOLD}  AUTO ACTIVITY GENERATOR — Moodle${NC}"
-echo    "  Container : ${CONTAINER}"
 echo    "  Interval  : ${INTERVAL}s / tick  |  User/tick : ${USERS_PER_TICK}"
 echo -e "${BOLD}╚══════════════════════════════════════════════════════╝${NC}"
+echo ""
 
-check_container
-load_databases
-select_db
+# Bước 1: Môi trường
+while true; do
+  setup_env && break
+done
+
+# Bước 2: Runtime (b → quay lại env)
+while true; do
+  setup_runtime && break
+  while true; do setup_env && break; done
+done
+
+# Tóm tắt kết nối
+echo ""
+sep
+if [ "$ENV_MODE" = "local" ]; then
+  info "Môi trường : Local"
+else
+  for i in $(seq 0 $((SERVER_COUNT - 1))); do
+    info "Server #$((i+1))  : ${SSH_USERS[$i]}@${SERVERS[$i]}:${SSH_PORTS[$i]}"
+  done
+fi
+[ "$RUNTIME" = "docker" ] \
+  && info "Runtime    : Docker  (container: $CONTAINER)" \
+  || info "Runtime    : Service (${MYSQL_HOST}:${MYSQL_PORT})"
+info "Interval   : ${INTERVAL}s / tick  |  User/tick: ${USERS_PER_TICK}"
+sep
+
+# Bước 3: Chọn DB từng server
+select_dbs
+
+# Bước 4: Validate data
 check_selected
 
 echo ""
 echo -e "  Bắt đầu. Nhấn ${BOLD}Ctrl+C${NC} để dừng."
 echo ""
 
+# =========================================
+# Main loop — tick song song trên tất cả server×DB
+# =========================================
+run_count=$SERVER_COUNT
+[ "$ENV_MODE" = "local" ] && run_count=1
+
 while true; do
   TICK=$((TICK+1))
   echo -e "  ── ${CYAN}Tick #${TICK}${NC}  $(date '+%H:%M:%S')  ─────────────────────────────"
 
-  for DB in "${SELECTED_DBS[@]}"; do
-    if do_tick "$DB"; then
-      TOTAL=$(quick_count "$DB")
-      ok "DB ${DB:0:8}…  activity ≈ ${TOTAL:-?} rows"
-    else
-      fail "DB ${DB:0:8}…  lỗi tick"
-    fi
+  tick_pids=()
+  for i in $(seq 0 $((run_count - 1))); do
+    srv_label="${SERVERS[$i]:-local}"
+    [ "$ENV_MODE" = "local" ] && srv_label="local"
+    db_str="${SERVER_SELECTED_DBS[$i]:-}"
+    [ -z "$db_str" ] && continue
+    IFS='|' read -ra DBS <<< "$db_str"
+    for DB in "${DBS[@]}"; do
+      (
+        if do_tick_on "$i" "$DB"; then
+          total=$(quick_count_on "$i" "$DB")
+          ok "[${srv_label}] DB ${DB:0:12}…  activity ≈ ${total:-?} rows"
+        else
+          fail "[${srv_label}] DB ${DB:0:12}…  lỗi tick"
+        fi
+      ) &
+      tick_pids+=($!)
+    done
   done
+  for pid in "${tick_pids[@]}"; do wait "$pid" 2>/dev/null || true; done
 
   echo ""
   sleep "$INTERVAL"

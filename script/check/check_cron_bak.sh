@@ -2,474 +2,779 @@
 set -euo pipefail
 
 # ============================================================
-#  CRON BACKUP + VERIFY RESTORE + TELEGRAM NOTIFY
+#  BACKUP + VERIFY + TELEGRAM NOTIFY — MariaDB/MySQL
+#  File: scripts/check/check_cron_bak.sh
 #
-#  Luồng:
-#    1. Chọn backup full (tất cả DB) hay 1 DB cụ thể
-#    2. Nhập thông tin source: docker container / systemd service
-#    3. Nhập tên verify container:
-#       - Nếu đã tồn tại + đang chạy → dùng luôn
-#       - Nếu chưa có → tự docker run (image lấy từ source container
-#         hoặc mariadb:10.4), xong thì tự stop + rm khi script kết thúc
-#    4. Với mỗi DB:
-#       a. Dump → .sql.gz + MD5
-#       b. Kiểm tra MD5
-#       c. Restore thử vào DB tạm trên verify container
-#       d. So sánh row count source vs restored
-#       e. Drop DB tạm
-#    5. Notify Telegram 1 lần duy nhất khi hoàn tất toàn bộ
-#    6. Tự cleanup verify container (nếu script tạo)
+#  Flow mỗi server (song song):
+#    1. Dump DB → .sql.gz + MD5 (lưu trên remote server)
+#    2. Tạo verify container tạm trên chính remote server
+#    3. Restore thử → đếm rows → so sánh range
+#    4. Cleanup verify container
+#  Sau khi tất cả server xong → 1 Telegram message tổng hợp
 # ============================================================
 
 # =========================================
-# ⚙️  TELEGRAM CONFIG — chỉnh tại đây
+# ⚙️  TELEGRAM CONFIG — chỉnh tại đây trước khi chạy
 # =========================================
 TELE_TOKEN="your_bot_token_here"
 TELE_CHAT_ID="your_chat_id_here"
-TELE_THREAD_ID=""
+TELE_THREAD_ID=""   # để trống nếu không dùng thread/topic
 
 # =========================================
 # Colors
 # =========================================
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
 
-ok()   { echo -e "  ${GREEN}✅ $1${NC}"; }
-fail() { echo -e "  ${RED}❌ $1${NC}"; }
-info() { echo -e "  ${CYAN}   $1${NC}"; }
-warn() { echo -e "  ${YELLOW}⚠️  $1${NC}"; }
-step() { echo -e "\n${CYAN}$1${NC}"; echo "  ────────────────────────────────────────────────────"; }
+ok()   { echo -e "  ${GREEN}✔${NC} $1"; }
+fail() { echo -e "  ${RED}✘${NC} $1"; }
+warn() { echo -e "  ${YELLOW}⚠${NC}  $1"; }
+info() { echo -e "  ${CYAN}→${NC} $1"; }
+dim()  { echo -e "  ${DIM}$1${NC}"; }
+sep()  { echo -e "  ${DIM}────────────────────────────────────────${NC}"; }
+step() { echo -e "\n${CYAN}$1${NC}"; sep; }
+
+quit() { echo ""; dim "Thoát."; echo ""; exit 0; }
 
 # =========================================
-# Verify container: tự tạo nếu chưa có
+# Biến môi trường
 # =========================================
-VRF_CREATED=false      # flag: script có tự tạo container không
-VRF_USER="root"
-VRF_PASS="Verify_Tmp_$(date +%s)"   # password ngẫu nhiên cho container tạm
+ENV_MODE=""
+RUNTIME=""
+SERVER_COUNT=0
+declare -a SERVERS=() SSH_USERS=() SSH_PORTS=()
+CONTAINER=""
+MYSQL_HOST="127.0.0.1"
+MYSQL_PORT=3306
+MYSQL_USER="root"
+MYSQL_PASS=""
+BACKUP_DIR="/root/mariadb-backup"
+VRF_CONTAINER="mariadb-verify-tmp"
+VRF_PASS="Verify_$(date +%s)"
+INTERVAL_RAW=""
+INTERVAL_SEC=0
 
-setup_verify_container() {
-    local CTR="$1"
+# Kết quả backup: mảng indexed theo server
+declare -a SRV_RESULTS=()
 
-    # Xác định image: ưu tiên lấy từ source container (nếu docker mode)
-    local IMAGE="mariadb:10.4"
-    if [ "$SRC_MODE" = "1" ]; then
-        local SRC_IMAGE
-        SRC_IMAGE=$(docker inspect -f '{{.Config.Image}}' "$SRC_CTR" 2>/dev/null || true)
-        [ -n "$SRC_IMAGE" ] && IMAGE="$SRC_IMAGE"
+# =========================================
+# Helper: đọc password ẩn
+# =========================================
+read_pass() {
+  local prompt="$1" varname="$2" pass="" char=""
+  printf "%s" "$prompt"
+  while IFS= read -r -s -n1 char; do
+    if   [[ -z "$char" ]]; then break
+    elif [[ "$char" == $'\x7f' || "$char" == $'\b' ]]; then
+      [ ${#pass} -gt 0 ] && { pass="${pass%?}"; printf "\b \b"; }
+    else
+      pass="${pass}${char}"; printf "*"
     fi
-
-    info "Tự tạo verify container '${CTR}' (image: ${IMAGE})..."
-    docker run -d \
-        --name "$CTR" \
-        -e MYSQL_ROOT_PASSWORD="$VRF_PASS" \
-        -e MYSQL_ROOT_HOST="%" \
-        "$IMAGE" \
-        --character-set-server=utf8mb4 \
-        --collation-server=utf8mb4_unicode_ci \
-        > /dev/null 2>&1 \
-        || { fail "docker run thất bại — kiểm tra Docker daemon."; exit 1; }
-
-    VRF_CREATED=true
-    info "Đợi MariaDB trong '${CTR}' sẵn sàng..."
-    local RETRY=0
-    until docker exec "$CTR" mysql -u"$VRF_USER" -p"$VRF_PASS" \
-            -e "SELECT 1;" > /dev/null 2>&1; do
-        RETRY=$((RETRY + 1))
-        [ "$RETRY" -ge 30 ] && { fail "Timeout — container verify không start được sau 30s."; exit 1; }
-        sleep 1
-        printf "."
-    done
-    echo ""
-    ok "Verify container '${CTR}' ready (${RETRY}s)."
+  done
+  echo ""
+  eval "$varname=\"$pass\""
 }
 
-# Cleanup: stop + rm verify container nếu script tự tạo
-cleanup_verify() {
-    if [ "$VRF_CREATED" = true ]; then
-        echo ""
-        info "Cleanup: dừng và xóa verify container '${VRF_CTR}'..."
-        docker stop "$VRF_CTR" > /dev/null 2>&1 || true
-        docker rm   "$VRF_CTR" > /dev/null 2>&1 || true
-        ok "Đã xóa verify container '${VRF_CTR}'."
-    fi
-}
-trap cleanup_verify EXIT
-
 # =========================================
-# Parse tần suất → giây
-#   Hỗ trợ: 30m  2h  1d  7d  2w  1y
-#   m=phút  h=giờ  d=ngày  w=tuần  y=năm
+# Helper: parse tần suất → giây
 # =========================================
 parse_interval() {
-    local RAW="$1"
-    local NUM UNIT
-
-    # Tách số và đơn vị (vd: "30m" → NUM=30 UNIT=m)
-    NUM=$(echo "$RAW" | grep -oP '^\d+')
-    UNIT=$(echo "$RAW" | grep -oP '[a-zA-Z]+$' | tr '[:upper:]' '[:lower:]')
-
-    if [ -z "$NUM" ] || [ -z "$UNIT" ]; then
-        echo "0"; return 1
-    fi
-
-    case "$UNIT" in
-        m|min)    echo $((NUM * 60)) ;;
-        h|hour)   echo $((NUM * 3600)) ;;
-        d|day)    echo $((NUM * 86400)) ;;
-        w|week)   echo $((NUM * 604800)) ;;
-        y|year)   echo $((NUM * 31536000)) ;;
-        *)        echo "0"; return 1 ;;
-    esac
+  local RAW="$1"
+  local NUM UNIT
+  NUM=$(echo "$RAW" | grep -oP '^\d+' || true)
+  UNIT=$(echo "$RAW" | grep -oP '[a-zA-Z]+$' | tr '[:upper:]' '[:lower:]' || true)
+  [ -z "$NUM" ] || [ -z "$UNIT" ] && { echo "0"; return 1; }
+  case "$UNIT" in
+    m|min)  echo $((NUM * 60)) ;;
+    h|hour) echo $((NUM * 3600)) ;;
+    d|day)  echo $((NUM * 86400)) ;;
+    w|week) echo $((NUM * 604800)) ;;
+    y|year) echo $((NUM * 31536000)) ;;
+    *)      echo "0"; return 1 ;;
+  esac
 }
 
 interval_label() {
-    local RAW="$1"
-    local NUM UNIT
-    NUM=$(echo "$RAW" | grep -oP '^\d+')
-    UNIT=$(echo "$RAW" | grep -oP '[a-zA-Z]+$' | tr '[:upper:]' '[:lower:]')
-    case "$UNIT" in
-        m|min)   echo "${NUM} phút" ;;
-        h|hour)  echo "${NUM} giờ" ;;
-        d|day)   echo "${NUM} ngày" ;;
-        w|week)  echo "${NUM} tuần" ;;
-        y|year)  echo "${NUM} năm" ;;
-        *)       echo "$RAW" ;;
+  local RAW="$1"
+  local NUM UNIT
+  NUM=$(echo "$RAW" | grep -oP '^\d+' || true)
+  UNIT=$(echo "$RAW" | grep -oP '[a-zA-Z]+$' | tr '[:upper:]' '[:lower:]' || true)
+  case "$UNIT" in
+    m|min)  echo "${NUM} phút" ;;
+    h|hour) echo "${NUM} giờ" ;;
+    d|day)  echo "${NUM} ngày" ;;
+    w|week) echo "${NUM} tuần" ;;
+    y|year) echo "${NUM} năm" ;;
+    *)      echo "$RAW" ;;
+  esac
+}
+
+# =========================================
+# Helper: chạy lệnh SQL trên 1 server — file tạm
+# =========================================
+ssh_exec() {
+  local idx=$1; shift
+  ssh -T -p "${SSH_PORTS[$idx]}" -o StrictHostKeyChecking=no \
+    "${SSH_USERS[$idx]}@${SERVERS[$idx]}" "$@"
+}
+
+mysql_q_remote() {
+  # mysql_q_remote idx query → stdout
+  local idx=$1; local query=$2
+  local sf; sf=$(mktemp /tmp/bak_sql_XXXXXX)
+  echo "$query" > "$sf"
+  if [ "$RUNTIME" = "docker" ]; then
+    ssh_exec "$idx" \
+      "docker exec -i $CONTAINER mysql -u\"$MYSQL_USER\" -p\"$MYSQL_PASS\" -N 2>/dev/null" \
+      < "$sf"
+  else
+    ssh_exec "$idx" \
+      "mysql -h\"$MYSQL_HOST\" -P\"$MYSQL_PORT\" -u\"$MYSQL_USER\" -p\"$MYSQL_PASS\" -N 2>/dev/null" \
+      < "$sf"
+  fi
+  rm -f "$sf"
+}
+
+mysql_q_local() {
+  # mysql_q_local query → stdout (ENV_MODE=local)
+  local query=$1
+  local sf; sf=$(mktemp /tmp/bak_sql_XXXXXX)
+  echo "$query" > "$sf"
+  if [ "$RUNTIME" = "docker" ]; then
+    docker exec -i "$CONTAINER" \
+      mysql -u"$MYSQL_USER" -p"$MYSQL_PASS" -N 2>/dev/null < "$sf"
+  else
+    mysql -h"$MYSQL_HOST" -P"$MYSQL_PORT" \
+      -u"$MYSQL_USER" -p"$MYSQL_PASS" -N 2>/dev/null < "$sf"
+  fi
+  rm -f "$sf"
+}
+
+mysql_q_on() {
+  local idx=$1; local query=$2
+  if [ "$ENV_MODE" = "local" ]; then
+    mysql_q_local "$query"
+  else
+    mysql_q_remote "$idx" "$query"
+  fi
+}
+
+# =========================================
+# BƯỚC 1: Chọn môi trường
+# =========================================
+setup_env() {
+  while true; do
+    echo ""
+    echo -e "  ${BOLD}Môi trường thực thi${NC}"
+    sep
+    echo -e "  ${CYAN}1)${NC}  Local   — DB đang chạy trên máy này"
+    echo -e "  ${CYAN}2)${NC}  Server  — DB đang chạy trên server remote"
+    echo -e "  ${CYAN}q)${NC}  Thoát"
+    echo ""
+    read -rp "  Chọn [1/2/q]: " choice
+    case "$choice" in
+      1)
+        ENV_MODE="local"
+        SERVER_COUNT=1
+        SERVERS=("localhost"); SSH_USERS=(""); SSH_PORTS=("")
+        return 0 ;;
+      2)
+        ENV_MODE="server"
+        echo ""
+        read -rp "  Số lượng server: " count
+        if ! [[ "$count" =~ ^[0-9]+$ ]] || [ "$count" -lt 1 ]; then
+          warn "Nhập số >= 1."; continue
+        fi
+        SERVER_COUNT=$count
+        SERVERS=(); SSH_USERS=(); SSH_PORTS=()
+        echo ""
+        for i in $(seq 1 $SERVER_COUNT); do
+          echo -e "  ${CYAN}── Server #${i} ──${NC}"
+          read -rp "    Host IP / domain : " host
+          read -rp "    SSH User (root)  : " input; user=${input:-root}
+          read -rp "    SSH Port (22)    : " input; port=${input:-22}
+          SERVERS+=("$host"); SSH_USERS+=("$user"); SSH_PORTS+=("$port")
+          echo ""
+        done
+        if ! check_ssh; then return 1; fi
+        return 0 ;;
+      q|Q) quit ;;
+      *) warn "Nhập 1, 2 hoặc q." ;;
     esac
+  done
+}
+
+check_ssh() {
+  echo ""
+  echo -e "  Kiểm tra SSH ${SERVER_COUNT} server cùng lúc..."
+  local tmp; tmp=$(mktemp -d); local pids=()
+  for i in $(seq 0 $((SERVER_COUNT - 1))); do
+    ( ssh -p "${SSH_PORTS[$i]}" -o ConnectTimeout=5 -o BatchMode=yes \
+        -o StrictHostKeyChecking=no "${SSH_USERS[$i]}@${SERVERS[$i]}" \
+        "echo ok" &>/dev/null \
+        && echo "ok" > "${tmp}/r_${i}" || echo "fail" > "${tmp}/r_${i}" ) &
+    pids+=($!)
+  done
+  for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+  echo ""
+  local all_ok=true
+  for i in $(seq 0 $((SERVER_COUNT - 1))); do
+    local r; r=$(cat "${tmp}/r_${i}" 2>/dev/null || echo "fail")
+    [ "$r" = "ok" ] \
+      && ok "${SSH_USERS[$i]}@${SERVERS[$i]}:${SSH_PORTS[$i]}" \
+      || { fail "${SSH_USERS[$i]}@${SERVERS[$i]}:${SSH_PORTS[$i]} — không kết nối được"; all_ok=false; }
+  done
+  rm -rf "$tmp"
+  [ "$all_ok" = true ] && return 0 || { echo ""; warn "Một số server không SSH được."; return 1; }
 }
 
 # =========================================
-# Chạy 1 cycle backup (dump + verify + notify)
+# BƯỚC 2: Chọn runtime
 # =========================================
-run_backup_cycle() {
-    local CYCLE="$1"
-
+setup_runtime() {
+  while true; do
     echo ""
-    echo -e "${BOLD}╔══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}  CYCLE #${CYCLE}  —  $(date '+%Y-%m-%d %H:%M:%S')${NC}"
-    echo -e "${BOLD}╚══════════════════════════════════════════════════════╝${NC}"
-
-    # Reset RESULTS cho mỗi cycle
-    RESULTS=()
-
-    # Lấy lại danh sách DB (full mode: re-detect để bắt DB mới)
-    if [ "$BACKUP_TYPE" = "1" ]; then
-        TARGET_DBS=()
-        local DB_LIST
-        DB_LIST=$(list_dbs 2>/dev/null || true)
-        while IFS= read -r db; do
-            [ -n "$db" ] && TARGET_DBS+=("$db")
-        done <<< "$DB_LIST"
-        info "DB phát hiện (${#TARGET_DBS[@]}): ${TARGET_DBS[*]}"
-    fi
-
-    BACKUP_START=$(date '+%Y-%m-%d %H:%M:%S')
-
-    for DB in "${TARGET_DBS[@]}"; do
-        backup_one "$DB" || true
-    done
-
-    BACKUP_END=$(date '+%Y-%m-%d %H:%M:%S')
-
-    # ── Summary terminal ─────────────────────────────────────
-    COUNT_OK=0; COUNT_FAIL=0
+    echo -e "  ${BOLD}Loại runtime${NC}"
+    sep
+    echo -e "  ${CYAN}1)${NC}  Docker container"
+    echo -e "  ${CYAN}2)${NC}  Service (systemd / native)"
+    echo -e "  ${CYAN}b)${NC}  Quay lại"
     echo ""
-    echo "  ════════════════════════════════════════════════════"
-    echo -e "  ${BOLD}KẾT QUẢ — Cycle #${CYCLE}${NC}"
-    echo "  ════════════════════════════════════════════════════"
-    echo "  Tổng DB    : ${#TARGET_DBS[@]}"
-    echo "  Bắt đầu    : ${BACKUP_START}"
-    echo "  Kết thúc   : ${BACKUP_END}"
-    echo "  Backup dir : ${BACKUP_DIR}"
-    echo ""
+    read -rp "  Chọn [1/2/b]: " choice
+    case "$choice" in
+      1)
+        RUNTIME="docker"
+        echo ""
+        read -rp "  Tên container (mariadb-104) : " input
+        CONTAINER=${input:-mariadb-104}
+        read -rp "  MySQL User   (root)        : " input; MYSQL_USER=${input:-root}
+        read_pass "  MySQL Pass                 : " MYSQL_PASS
+        if check_runtime; then return 0; fi ;;
+      2)
+        RUNTIME="service"
+        echo ""
+        read -rp "  MariaDB Host (127.0.0.1) : " input; MYSQL_HOST=${input:-127.0.0.1}
+        read -rp "  MariaDB Port (3306)      : " input; MYSQL_PORT=${input:-3306}
+        read -rp "  MySQL User   (root)      : " input; MYSQL_USER=${input:-root}
+        read_pass "  MySQL Pass               : " MYSQL_PASS
+        if check_runtime; then return 0; fi ;;
+      b|B) return 1 ;;
+      *) warn "Nhập 1, 2 hoặc b." ;;
+    esac
+  done
+}
 
-    for r in "${RESULTS[@]}"; do
-        IFS='|' read -r STATUS DB MSG ROWS_PRE ROWS_POST ROWS_VRF FILE_SIZE FNAME <<< "$r"
-        if [ "$STATUS" = "OK" ]; then
-            COUNT_OK=$((COUNT_OK + 1))
-            ok "  ${DB}"
-            info "   File: ${FNAME}  Size: ${FILE_SIZE}"
-            info "   Rows: pre=${ROWS_PRE}  post=${ROWS_POST}  restored=${ROWS_VRF}"
+check_runtime() {
+  echo ""
+  local check_count=$SERVER_COUNT
+  [ "$ENV_MODE" = "local" ] && check_count=1
+  local tmp; tmp=$(mktemp -d); local pids=()
+  echo -e "  Kiểm tra runtime ${check_count} server cùng lúc..."
+  for i in $(seq 0 $((check_count - 1))); do
+    (
+      if [ "$RUNTIME" = "docker" ]; then
+        local running
+        if [ "$ENV_MODE" = "server" ]; then
+          running=$(ssh_exec "$i" \
+            "docker inspect -f '{{.State.Running}}' $CONTAINER 2>/dev/null || echo NOT_FOUND")
         else
-            COUNT_FAIL=$((COUNT_FAIL + 1))
-            fail "  ${DB}"
-            info "   Lỗi: ${MSG}"
-            info "   Rows: pre=${ROWS_PRE}  post=${ROWS_POST}  restored=${ROWS_VRF}"
+          running=$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || echo "NOT_FOUND")
         fi
-    done
-
-    echo ""
-    echo "  Thành công: ${COUNT_OK} / ${#TARGET_DBS[@]}"
-    [ "$COUNT_FAIL" -gt 0 ] && echo "  Thất bại  : ${COUNT_FAIL} / ${#TARGET_DBS[@]}"
-    echo "  ════════════════════════════════════════════════════"
-
-    # ── Telegram notify ──────────────────────────────────────
-    TELE_DETAIL=""
-    for r in "${RESULTS[@]}"; do
-        IFS='|' read -r STATUS DB MSG ROWS_PRE ROWS_POST ROWS_VRF FILE_SIZE FNAME <<< "$r"
-        if [ "$STATUS" = "OK" ]; then
-            TELE_DETAIL+="
-✅ <code>${DB}</code>  ${ROWS_VRF} rows  ${FILE_SIZE}
-<code>${FNAME}</code>"
-        else
-            TELE_DETAIL+="
-❌ <code>${DB}</code>  ${MSG}
-pre=${ROWS_PRE}  post=${ROWS_POST}  restored=${ROWS_VRF}"
-        fi
-    done
-
-    if [ "$COUNT_FAIL" -eq 0 ]; then
-        TELE_ICON="✅"
-    else
-        TELE_ICON="⚠️"
-    fi
-
-    local CYCLE_LABEL=""
-    [ "$INTERVAL_SEC" -gt 0 ] && CYCLE_LABEL="  Cycle #${CYCLE} / every $(interval_label "$INTERVAL_RAW")"
-
-    tele_send "${TELE_ICON} <b>BACKUP DB</b>${CYCLE_LABEL}
-${TELE_DETAIL}
-File backup: <code>${BACKUP_DIR}</code>
-Start: ${BACKUP_START}
-End: ${BACKUP_END}"
-
-    if [ "$COUNT_FAIL" -eq 0 ]; then
-        ok "Cycle #${CYCLE} hoàn tất. Đã notify Telegram."
-    else
-        warn "Cycle #${CYCLE} có ${COUNT_FAIL} DB lỗi. Đã notify Telegram."
-    fi
+        [ "$running" = "NOT_FOUND" ] && { echo "fail:container '$CONTAINER' không tồn tại" > "${tmp}/r_${i}"; exit 0; }
+        [ "$running" != "true" ]     && { echo "fail:container '$CONTAINER' không đang chạy" > "${tmp}/r_${i}"; exit 0; }
+      fi
+      if ! mysql_q_on "$i" "SELECT 1;" &>/dev/null; then
+        echo "fail:không kết nối được MariaDB" > "${tmp}/r_${i}"; exit 0
+      fi
+      echo "ok" > "${tmp}/r_${i}"
+    ) &
+    pids+=($!)
+  done
+  for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+  echo ""
+  local all_ok=true
+  for i in $(seq 0 $((check_count - 1))); do
+    local r; r=$(cat "${tmp}/r_${i}" 2>/dev/null || echo "fail:không có kết quả")
+    local label; [ "$ENV_MODE" = "server" ] && label="${SERVERS[$i]}" || label="local"
+    [ "$r" = "ok" ] && ok "$label" || { fail "$label — ${r#fail:}"; all_ok=false; }
+  done
+  rm -rf "$tmp"
+  [ "$all_ok" = true ] && return 0 || return 1
 }
 
 # =========================================
-# Helper: password hiển thị *
+# BƯỚC 3: Chọn DB — lần lượt từng server
+# SERVER_SELECTED_DBS[i] = "db1|db2|..." (pipe-separated)
 # =========================================
-read_pass() {
-    local prompt="$1" varname="$2" pass="" char=""
-    printf "%s" "$prompt"
-    while IFS= read -r -s -n1 char; do
-        if   [[ -z "$char" ]];                              then break
-        elif [[ "$char" == $'\x7f' || "$char" == $'\b' ]]; then
-            [ ${#pass} -gt 0 ] && { pass="${pass%?}"; printf "\b \b"; }
+select_dbs() {
+  local run_count=$SERVER_COUNT
+  [ "$ENV_MODE" = "local" ] && run_count=1
+  declare -g -a SERVER_SELECTED_DBS=()
+
+  for i in $(seq 0 $((run_count - 1))); do
+    local label; [ "$ENV_MODE" = "server" ] && label="${SERVERS[$i]}" || label="local"
+
+    mapfile -t DBS_ON_SERVER < <(
+      mysql_q_on "$i" "SELECT schema_name
+               FROM information_schema.schemata
+               WHERE schema_name NOT IN (
+                 'information_schema','performance_schema',
+                 'mysql','sys','innodb'
+               )
+               ORDER BY schema_name;" 2>/dev/null
+    )
+
+    if [ ${#DBS_ON_SERVER[@]} -eq 0 ]; then
+      warn "Server ${label} không có DB nào — bỏ qua."
+      SERVER_SELECTED_DBS+=(""); continue
+    fi
+
+    while true; do
+      echo ""
+      echo -e "  ${BOLD}[Server: ${CYAN}${label}${NC}${BOLD}]${NC}  Chọn DB để backup"
+      sep
+      for j in "${!DBS_ON_SERVER[@]}"; do
+        printf "  ${CYAN}%2d)${NC}  %s\n" "$((j+1))" "${DBS_ON_SERVER[$j]}"
+      done
+      echo -e "  ${CYAN} 0)${NC}  Tất cả"
+      echo ""
+      dim "  Chọn 1 hoặc nhiều, cách nhau bởi dấu phẩy. Vd: 1,2"
+      dim "  q) Thoát"
+      echo ""
+      read -rp "  Nhập [0-${#DBS_ON_SERVER[@]}/q]: " input
+
+      case "${input// /}" in
+        q|Q) quit ;;
+        0)
+          local joined; joined=$(printf '%s|' "${DBS_ON_SERVER[@]}")
+          SERVER_SELECTED_DBS+=("${joined%|}"); break ;;
+      esac
+
+      IFS=',' read -ra choices <<< "${input// /}"
+      local picked=() valid=1
+      for choice in "${choices[@]}"; do
+        if [[ "$choice" =~ ^[0-9]+$ ]] && \
+           [ "$choice" -ge 1 ] && [ "$choice" -le "${#DBS_ON_SERVER[@]}" ]; then
+          picked+=("${DBS_ON_SERVER[$((choice-1))]}")
         else
-            pass="${pass}${char}"; printf "*"
+          warn "'${choice}' không hợp lệ."; valid=0; break
         fi
+      done
+      [ "$valid" -eq 0 ] && continue
+      mapfile -t picked < <(printf '%s\n' "${picked[@]}" | sort -u)
+      if [ ${#picked[@]} -gt 0 ]; then
+        local joined; joined=$(printf '%s|' "${picked[@]}")
+        SERVER_SELECTED_DBS+=("${joined%|}"); break
+      fi
     done
-    echo ""
-    eval "$varname=\"$pass\""
+  done
 }
 
 # =========================================
-# Telegram: gửi 1 message (cuối)
+# BƯỚC 4: Cấu hình backup
+# =========================================
+setup_config() {
+  echo ""
+  echo -e "  ${BOLD}Cấu hình backup${NC}"
+  sep
+  read -rp "  Thư mục backup trên server (/root/mariadb-backup) : " input
+  BACKUP_DIR=${input:-/root/mariadb-backup}
+
+  read -rp "  Tên verify container (mariadb-verify-tmp)         : " input
+  VRF_CONTAINER=${input:-mariadb-verify-tmp}
+
+  echo ""
+  echo -e "  ${BOLD}Tần suất backup${NC}"
+  dim "  Định dạng: 30m | 6h | 1d | 7d | 2w | 1y  (để trống = 1 lần)"
+  echo ""
+  read -rp "  Tần suất (Enter = 1 lần): " INTERVAL_RAW
+
+  INTERVAL_SEC=0
+  if [ -n "$INTERVAL_RAW" ]; then
+    INTERVAL_SEC=$(parse_interval "$INTERVAL_RAW" 2>/dev/null || echo 0)
+    if [ "${INTERVAL_SEC:-0}" -le 0 ]; then
+      warn "Định dạng không hợp lệ — sẽ chạy 1 lần."
+      INTERVAL_RAW=""; INTERVAL_SEC=0
+    fi
+  fi
+}
+
+# =========================================
+# Telegram: gửi message
 # =========================================
 tele_send() {
-    local TEXT="$1"
-    if [ -z "$TELE_TOKEN" ] || [ -z "$TELE_CHAT_ID" ] \
-       || [ "$TELE_TOKEN" = "your_bot_token_here" ]; then
-        warn "Telegram chưa config — bỏ qua notify."
-        return 0
-    fi
-
-    local EXTRA=""
-    [ -n "$TELE_THREAD_ID" ] && EXTRA=", \"message_thread_id\": ${TELE_THREAD_ID}"
-
-    local ESCAPED
-    ESCAPED=$(printf '%s' "$TEXT" | python3 -c \
-        "import sys,json; print(json.dumps(sys.stdin.read()))" 2>/dev/null \
-        || printf '"%s"' "$(printf '%s' "$TEXT" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' ')")
-
-    curl -s -X POST \
-        "https://api.telegram.org/bot${TELE_TOKEN}/sendMessage" \
-        -H "Content-Type: application/json" \
-        -d "{\"chat_id\": \"${TELE_CHAT_ID}\", \"text\": ${ESCAPED}, \"parse_mode\": \"HTML\"${EXTRA}}" \
-        > /dev/null 2>&1 || warn "Gửi Telegram thất bại (curl lỗi)."
+  local text="$1"
+  if [ -z "$TELE_TOKEN" ] || [ "$TELE_TOKEN" = "your_bot_token_here" ] \
+     || [ -z "$TELE_CHAT_ID" ]; then
+    warn "Telegram chưa config — bỏ qua notify."
+    return 0
+  fi
+  local extra=""
+  [ -n "$TELE_THREAD_ID" ] && extra=", \"message_thread_id\": ${TELE_THREAD_ID}"
+  local escaped
+  escaped=$(printf '%s' "$text" | python3 -c \
+    "import sys,json; print(json.dumps(sys.stdin.read()))" 2>/dev/null \
+    || printf '"%s"' "$(printf '%s' "$text" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' ')")
+  curl -s -X POST \
+    "https://api.telegram.org/bot${TELE_TOKEN}/sendMessage" \
+    -H "Content-Type: application/json" \
+    -d "{\"chat_id\": \"${TELE_CHAT_ID}\", \"text\": ${escaped}, \"parse_mode\": \"HTML\"${extra}}" \
+    > /dev/null 2>&1 || warn "Gửi Telegram thất bại."
 }
 
 # =========================================
-# Đếm tổng rows của 1 DB trên source
-# (hỗ trợ docker hoặc systemd)
+# Đếm rows của 1 DB trên source (file tạm)
 # =========================================
 count_rows_src() {
-    local TARGET_DB="$1"
-    local TBLS total=0
+  local idx=$1; local DB=$2
+  # Chạy shell script mini trực tiếp trên remote — tránh escape/truncate
+  local sh; sh=$(mktemp /tmp/bak_cnt_XXXXXX.sh)
+  cat > "$sh" << 'SHEOF'
+#!/bin/bash
+# Args: RUNTIME CONTAINER MYSQL_USER MYSQL_PASS MYSQL_HOST MYSQL_PORT DB
+RUNTIME="$1"; CTR="$2"; USR="$3"; PASS="$4"
+HOST="$5"; PORT="$6"; DB="$7"
+mysql_cmd() {
+  if [ "$RUNTIME" = "docker" ]; then
+    docker exec -i "$CTR" mysql -u"$USR" -p"$PASS" -N 2>/dev/null
+  else
+    mysql -h"$HOST" -P"$PORT" -u"$USR" -p"$PASS" -N 2>/dev/null
+  fi
+}
+TABLES=$(echo "SELECT table_name FROM information_schema.tables WHERE table_schema='$DB' AND table_type='BASE TABLE';" | mysql_cmd)
+total=0
+while IFS= read -r tbl; do
+  [ -z "$tbl" ] && continue
+  cnt=$(echo "SELECT COUNT(*) FROM \`$DB\`.\`$tbl\`;" | mysql_cmd | tr -d '[:space:]')
+  total=$(( total + ${cnt:-0} ))
+done <<< "$TABLES"
+echo $total
+SHEOF
+  chmod +x "$sh"
 
-    if [ "$SRC_MODE" = "1" ]; then
-        TBLS=$(docker exec "$SRC_CTR" mysql -u"$SRC_USER" -p"$SRC_PASS" -N \
-            -e "SHOW TABLES FROM \`${TARGET_DB}\`;" 2>/dev/null | tr '\n' ' ')
-        for t in $TBLS; do
-            local c
-            c=$(docker exec "$SRC_CTR" mysql -u"$SRC_USER" -p"$SRC_PASS" -N \
-                -e "SELECT COUNT(*) FROM \`${TARGET_DB}\`.\`${t}\`;" 2>/dev/null \
-                | tail -1 | tr -d '[:space:]')
-            total=$((total + ${c:-0}))
+  local result
+  if [ "$ENV_MODE" = "server" ]; then
+    local remote_sh="/tmp/bak_cnt_${idx}_$$.sh"
+    scp -P "${SSH_PORTS[$idx]}" -o StrictHostKeyChecking=no \
+      "$sh" "${SSH_USERS[$idx]}@${SERVERS[$idx]}:${remote_sh}" &>/dev/null
+    result=$(ssh_exec "$idx" \
+      "bash ${remote_sh} '$RUNTIME' '$CONTAINER' '$MYSQL_USER' '$MYSQL_PASS' \
+       '$MYSQL_HOST' '$MYSQL_PORT' '$DB' 2>/dev/null; rm -f ${remote_sh}" \
+      | tr -d '[:space:]')
+  else
+    result=$(bash "$sh" "$RUNTIME" "$CONTAINER" "$MYSQL_USER" "$MYSQL_PASS" \
+      "$MYSQL_HOST" "$MYSQL_PORT" "$DB" 2>/dev/null | tr -d '[:space:]')
+  fi
+  rm -f "$sh"
+  echo "${result:-0}"
+}
+
+
+# =========================================
+# Setup verify container trên 1 server
+# =========================================
+setup_vrf_container_on() {
+  local idx=$1; local vrf_ctr=$2
+  local label; [ "$ENV_MODE" = "server" ] && label="${SERVERS[$idx]}" || label="local"
+
+  # Lấy image từ source container
+  local vrf_image="mariadb:10.4"
+  if [ "$RUNTIME" = "docker" ]; then
+    if [ "$ENV_MODE" = "server" ]; then
+      vrf_image=$(ssh_exec "$idx"         "docker inspect -f '{{.Config.Image}}' $CONTAINER 2>/dev/null || echo mariadb:10.4"         | tr -d '[:space:]')
+    else
+      vrf_image=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER" 2>/dev/null || echo "mariadb:10.4")
+    fi
+  fi
+
+  info "[${label}] Tạo verify container '${vrf_ctr}' (image: ${vrf_image})..."
+
+  if [ "$ENV_MODE" = "server" ]; then
+    ssh_exec "$idx" "docker rm -f ${vrf_ctr} 2>/dev/null || true" &>/dev/null
+    ssh_exec "$idx"       "docker run -d --name ${vrf_ctr}        -e MYSQL_ROOT_PASSWORD="${VRF_PASS}"        -e MYSQL_ROOT_HOST="%"        ${vrf_image}        --character-set-server=utf8mb4        --collation-server=utf8mb4_unicode_ci        > /dev/null 2>&1" &>/dev/null       || { fail "[${label}] Không tạo được verify container"; return 1; }
+  else
+    docker rm -f "$vrf_ctr" 2>/dev/null || true
+    docker run -d --name "$vrf_ctr"       -e MYSQL_ROOT_PASSWORD="$VRF_PASS"       -e MYSQL_ROOT_HOST="%"       "$vrf_image"       --character-set-server=utf8mb4       --collation-server=utf8mb4_unicode_ci       > /dev/null 2>&1       || { fail "[${label}] Không tạo được verify container"; return 1; }
+  fi
+
+  # Đợi ready
+  local retry=0
+  while [ $retry -lt 30 ]; do
+    if [ "$ENV_MODE" = "server" ]; then
+      ssh_exec "$idx"         "docker exec ${vrf_ctr} mysql -uroot -p"${VRF_PASS}" -e 'SELECT 1;' > /dev/null 2>&1"         && { ok "[${label}] Verify container ready (${retry}s)"; return 0; }
+    else
+      docker exec "$vrf_ctr" mysql -uroot -p"$VRF_PASS"         -e "SELECT 1;" > /dev/null 2>&1         && { ok "[${label}] Verify container ready (${retry}s)"; return 0; }
+    fi
+    retry=$((retry+1)); sleep 1
+  done
+
+  fail "[${label}] Verify container timeout"; return 1
+}
+
+# =========================================
+# Cleanup verify container trên 1 server
+# =========================================
+_cleanup_vrf() {
+  local idx=$1; local ctr=$2
+  if [ "$ENV_MODE" = "server" ]; then
+    ssh_exec "$idx"       "docker stop ${ctr} 2>/dev/null; docker rm ${ctr} 2>/dev/null || true"       &>/dev/null || true
+  else
+    docker stop "$ctr" 2>/dev/null || true
+    docker rm   "$ctr" 2>/dev/null || true
+  fi
+}
+
+# =========================================
+# Backup 1 DB — dùng verify container đã có sẵn
+# =========================================
+backup_one_on() {
+  local idx=$1; local DB=$2; local vrf_ctr=$3; local result_file=$4
+  local label; [ "$ENV_MODE" = "server" ] && label="${SERVERS[$idx]}" || label="local"
+  local TS; TS=$(date '+%Y%m%d_%H%M%S')
+  local dump_fname="backup_${DB}_${TS}.sql.gz"
+  local dump_path="${BACKUP_DIR}/${dump_fname}"
+  local vrf_db="_verify_${TS}"
+  local rows_pre=0 rows_post=0 rows_vrf=0 file_size="—"
+  local status="OK" msg=""
+
+  echo -e "  ${BOLD}[${label}] DB: ${DB}${NC}"
+
+  # ── Tạo thư mục backup ──
+  if [ "$ENV_MODE" = "server" ]; then
+    ssh_exec "$idx" "mkdir -p ${BACKUP_DIR}" &>/dev/null       || { echo "FAIL|${DB}|${label}|Không tạo được thư mục backup|0|0|0|—|—" > "$result_file"; return 1; }
+  else
+    mkdir -p "${BACKUP_DIR}"
+  fi
+
+  # ── a. Đếm rows trước dump ──
+  rows_pre=$(count_rows_src "$idx" "$DB" 2>/dev/null || echo 0)
+  info "[${label}] ${DB} — pre-dump rows: ${rows_pre}"
+
+  # ── b. Dump ──
+  info "[${label}] ${DB} — đang dump..."
+  local dump_ok=true
+  if [ "$ENV_MODE" = "server" ]; then
+    if [ "$RUNTIME" = "docker" ]; then
+      ssh_exec "$idx"         "docker exec $CONTAINER mysqldump --single-transaction --routines --triggers --opt          -u"$MYSQL_USER" -p"$MYSQL_PASS" "$DB" 2>/dev/null | gzip > "${dump_path}""         || dump_ok=false
+    else
+      ssh_exec "$idx"         "mysqldump --single-transaction --routines --triggers --opt          -u"$MYSQL_USER" -p"$MYSQL_PASS" "$DB" 2>/dev/null | gzip > "${dump_path}""         || dump_ok=false
+    fi
+  else
+    if [ "$RUNTIME" = "docker" ]; then
+      docker exec "$CONTAINER" mysqldump --single-transaction --routines --triggers --opt         -u"$MYSQL_USER" -p"$MYSQL_PASS" "$DB" 2>/dev/null | gzip > "$dump_path" || dump_ok=false
+    else
+      mysqldump --single-transaction --routines --triggers --opt         -u"$MYSQL_USER" -p"$MYSQL_PASS" "$DB" 2>/dev/null | gzip > "$dump_path" || dump_ok=false
+    fi
+  fi
+
+  if [ "$dump_ok" = false ]; then
+    echo "FAIL|${DB}|${label}|Dump thất bại|${rows_pre}|0|0|—|—" > "$result_file"; return 1
+  fi
+
+  if [ "$ENV_MODE" = "server" ]; then
+    file_size=$(ssh_exec "$idx" "du -sh "${dump_path}" 2>/dev/null | cut -f1" | tr -d '[:space:]')
+    ssh_exec "$idx" "md5sum "${dump_path}" > "${dump_path}.md5"" &>/dev/null
+    local md5_ok
+    md5_ok=$(ssh_exec "$idx"       "cd "${BACKUP_DIR}" && md5sum -c "${dump_fname}.md5" --quiet 2>/dev/null && echo ok || echo fail")
+  else
+    file_size=$(du -sh "$dump_path" 2>/dev/null | cut -f1 | tr -d '[:space:]')
+    md5sum "$dump_path" > "${dump_path}.md5"
+    local md5_ok
+    md5_ok=$(cd "${BACKUP_DIR}" && md5sum -c "${dump_fname}.md5" --quiet 2>/dev/null && echo ok || echo fail)
+  fi
+
+  if [ "${md5_ok:-fail}" != "ok" ]; then
+    echo "FAIL|${DB}|${label}|MD5 không khớp|${rows_pre}|0|0|${file_size}|${dump_fname}" > "$result_file"
+    return 1
+  fi
+  ok "[${label}] ${DB} — dump OK (${file_size}) → ${dump_fname}"
+
+  # ── c. Đếm rows sau dump ──
+  rows_post=$(count_rows_src "$idx" "$DB" 2>/dev/null || echo 0)
+
+  # ── d. Tạo DB tạm trên verify container ──
+  if [ "$ENV_MODE" = "server" ]; then
+    ssh_exec "$idx"       "docker exec ${vrf_ctr} mysql -uroot -p"${VRF_PASS}"        -e 'CREATE DATABASE \`${vrf_db}\` CHARACTER SET utf8mb4;' 2>/dev/null"       || { echo "FAIL|${DB}|${label}|Không tạo DB tạm trên verify container|${rows_pre}|${rows_post}|0|${file_size}|${dump_fname}" > "$result_file"; return 1; }
+  else
+    docker exec "$vrf_ctr" mysql -uroot -p"$VRF_PASS"       -e "CREATE DATABASE \`${vrf_db}\` CHARACTER SET utf8mb4;" 2>/dev/null       || { echo "FAIL|${DB}|${label}|Không tạo DB tạm trên verify container|${rows_pre}|${rows_post}|0|${file_size}|${dump_fname}" > "$result_file"; return 1; }
+  fi
+
+  # ── e. Restore thử ──
+  info "[${label}] ${DB} — restore thử..."
+  local restore_ok=true
+  if [ "$ENV_MODE" = "server" ]; then
+    ssh_exec "$idx"       "gunzip -c "${dump_path}" | docker exec -i ${vrf_ctr}        mysql -uroot -p"${VRF_PASS}" "${vrf_db}" 2>/dev/null"       || restore_ok=false
+  else
+    gunzip -c "$dump_path" | docker exec -i "$vrf_ctr"       mysql -uroot -p"$VRF_PASS" "$vrf_db" 2>/dev/null || restore_ok=false
+  fi
+
+  if [ "$restore_ok" = false ]; then
+    # Drop DB tạm
+    if [ "$ENV_MODE" = "server" ]; then
+      ssh_exec "$idx"         "docker exec ${vrf_ctr} mysql -uroot -p"${VRF_PASS}"          -e 'DROP DATABASE IF EXISTS \`${vrf_db}\`;' 2>/dev/null || true" &>/dev/null
+    else
+      docker exec "$vrf_ctr" mysql -uroot -p"$VRF_PASS"         -e "DROP DATABASE IF EXISTS \`${vrf_db}\`;" 2>/dev/null || true
+    fi
+    echo "FAIL|${DB}|${label}|Restore thử thất bại|${rows_pre}|${rows_post}|0|${file_size}|${dump_fname}" > "$result_file"
+    return 1
+  fi
+  ok "[${label}] ${DB} — restore thử OK"
+
+  # ── f. Đếm rows verify ──
+  local sh; sh=$(mktemp /tmp/bak_vrf_cnt_XXXXXX.sh)
+  printf '%s\n' \
+    '#!/bin/bash' \
+    'VRF_CTR="$1"; VRF_PASS="$2"; VRF_DB="$3"' \
+    'TABLES=$(docker exec "$VRF_CTR" mysql -uroot -p"$VRF_PASS" -N -e "SELECT table_name FROM information_schema.tables WHERE table_schema='"'"'$VRF_DB'"'"' AND table_type='"'"'BASE TABLE'"'"';" 2>/dev/null)' \
+    'total=0' \
+    'while IFS= read -r tbl; do' \
+    '  [ -z "$tbl" ] && continue' \
+    '  cnt=$(docker exec "$VRF_CTR" mysql -uroot -p"$VRF_PASS" -N -e "SELECT COUNT(*) FROM \`$VRF_DB\`.\`$tbl\`;" 2>/dev/null | tr -d "[:space:]")' \
+    '  total=$(( total + ${cnt:-0} ))' \
+    'done <<< "$TABLES"' \
+    'echo $total' > "$sh"
+  chmod +x "$sh"
+
+  if [ "$ENV_MODE" = "server" ]; then
+    local remote_sh="/tmp/bak_vrf_cnt_${idx}_$$.sh"
+    scp -P "${SSH_PORTS[$idx]}" -o StrictHostKeyChecking=no \
+      "$sh" "${SSH_USERS[$idx]}@${SERVERS[$idx]}:${remote_sh}" &>/dev/null
+    rows_vrf=$(ssh_exec "$idx" \
+      "bash ${remote_sh} '${vrf_ctr}' '${VRF_PASS}' '${vrf_db}'; rm -f ${remote_sh}" \
+      2>/dev/null | tr -d '[:space:]')
+  else
+    rows_vrf=$(bash "$sh" "$vrf_ctr" "$VRF_PASS" "$vrf_db" 2>/dev/null | tr -d '[:space:]')
+  fi
+  rm -f "$sh"
+  rows_vrf=${rows_vrf:-0}
+  # ── g. Drop DB tạm ──
+  if [ "$ENV_MODE" = "server" ]; then
+    ssh_exec "$idx"       "docker exec ${vrf_ctr} mysql -uroot -p"${VRF_PASS}"        -e 'DROP DATABASE IF EXISTS \`${vrf_db}\`;' 2>/dev/null || true" &>/dev/null
+  else
+    docker exec "$vrf_ctr" mysql -uroot -p"$VRF_PASS"       -e "DROP DATABASE IF EXISTS \`${vrf_db}\`;" 2>/dev/null || true
+  fi
+
+  # ── h. Verify range ──
+  info "[${label}] ${DB} — rows: pre=${rows_pre}  post=${rows_post}  restored=${rows_vrf}"
+  info "[${label}] ${DB} — valid range: ${rows_pre} ≤ restored ≤ ${rows_post}"
+
+  if [ "${rows_vrf}" -lt "${rows_pre}" ] || [ "${rows_vrf}" -gt "${rows_post}" ]; then
+    msg="Row count ngoài range (pre:${rows_pre} ≤ restored:${rows_vrf} ≤ post:${rows_post})"
+    fail "[${label}] ${DB} — ${msg}"
+    echo "FAIL|${DB}|${label}|${msg}|${rows_pre}|${rows_post}|${rows_vrf}|${file_size}|${dump_fname}" > "$result_file"
+    return 1
+  fi
+
+  ok "[${label}] ${DB} — verify OK. restored=${rows_vrf} trong range [${rows_pre}, ${rows_post}]"
+  echo "OK|${DB}|${label}||${rows_pre}|${rows_post}|${rows_vrf}|${file_size}|${dump_fname}" > "$result_file"
+}
+
+# =========================================
+# Chạy 1 cycle: server song song, DB tuần tự
+# =========================================
+run_cycle() {
+  local cycle=$1
+  local run_count=$SERVER_COUNT
+  [ "$ENV_MODE" = "local" ] && run_count=1
+  local cycle_start; cycle_start=$(date '+%Y-%m-%d %H:%M:%S')
+
+  echo ""
+  echo -e "${BOLD}╔══════════════════════════════════════════════════════╗${NC}"
+  echo -e "${BOLD}  CYCLE #${cycle}  —  ${cycle_start}${NC}"
+  echo -e "${BOLD}╚══════════════════════════════════════════════════════╝${NC}"
+
+  local tmp_dir; tmp_dir=$(mktemp -d)
+  local srv_pids=()
+
+  # Mỗi server chạy trong 1 subshell song song
+  for i in $(seq 0 $((run_count - 1))); do
+    local db_str="${SERVER_SELECTED_DBS[$i]:-}"
+    [ -z "$db_str" ] && continue
+
+    (
+      local label; [ "$ENV_MODE" = "server" ] && label="${SERVERS[$i]}" || label="local"
+      local vrf_ctr="${VRF_CONTAINER}_${i}"
+      IFS='|' read -ra DBS <<< "$db_str"
+
+      # Setup 1 verify container cho server này
+      if ! setup_vrf_container_on "$i" "$vrf_ctr"; then
+        # Ghi fail cho tất cả DB của server này
+        for DB in "${DBS[@]}"; do
+          echo "FAIL|${DB}|${label}|Không tạo được verify container|0|0|0|—|—"             > "${tmp_dir}/r_${i}_${DB}"
         done
+        exit 1
+      fi
+
+      # Backup từng DB tuần tự dùng chung verify container
+      for DB in "${DBS[@]}"; do
+        local rf="${tmp_dir}/r_${i}_${DB}"
+        backup_one_on "$i" "$DB" "$vrf_ctr" "$rf"
+      done
+
+      # Cleanup verify container sau khi xong tất cả DB
+      _cleanup_vrf "$i" "$vrf_ctr"
+      info "[${label}] Đã xóa verify container '${vrf_ctr}'."
+    ) &
+    srv_pids+=($!)
+  done
+
+  for pid in "${srv_pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+
+  local cycle_end; cycle_end=$(date '+%Y-%m-%d %H:%M:%S')
+  local count_ok=0 count_fail=0 tele_detail=""
+
+  echo ""
+  echo "  ════════════════════════════════════════════════════"
+  echo -e "  ${BOLD}KẾT QUẢ — Cycle #${cycle}${NC}"
+  echo "  ════════════════════════════════════════════════════"
+  echo "  Bắt đầu  : ${cycle_start}"
+  echo "  Kết thúc : ${cycle_end}"
+  echo ""
+
+  for rf in "${tmp_dir}"/r_*; do
+    [ -f "$rf" ] || continue
+    local last_line; last_line=$(grep '|' "$rf" | tail -1)
+    [ -z "$last_line" ] && continue
+    IFS='|' read -r STATUS DB LABEL MSG ROWS_PRE ROWS_POST ROWS_VRF FILE_SIZE FNAME <<< "$last_line"
+
+    if [ "$STATUS" = "OK" ]; then
+      count_ok=$((count_ok+1))
+      ok "[${LABEL}] ${DB}  ${FILE_SIZE}  restored=${ROWS_VRF}"
+      tele_detail+="
+✅ <b>${LABEL}</b> — <code>${DB}</code>
+   ${FILE_SIZE}  |  rows: pre=${ROWS_PRE}  restored=${ROWS_VRF}  post=${ROWS_POST}
+   File: <code>${FNAME}</code>"
     else
-        TBLS=$(mysql -u"$SRC_USER" -p"$SRC_PASS" -N \
-            -e "SHOW TABLES FROM \`${TARGET_DB}\`;" 2>/dev/null | tr '\n' ' ')
-        for t in $TBLS; do
-            local c
-            c=$(mysql -u"$SRC_USER" -p"$SRC_PASS" -N \
-                -e "SELECT COUNT(*) FROM \`${TARGET_DB}\`.\`${t}\`;" 2>/dev/null \
-                | tail -1 | tr -d '[:space:]')
-            total=$((total + ${c:-0}))
-        done
+      count_fail=$((count_fail+1))
+      fail "[${LABEL}] ${DB} — ${MSG}"
+      tele_detail+="
+❌ <b>${LABEL}</b> — <code>${DB}</code>
+   Lỗi: ${MSG}
+   rows: pre=${ROWS_PRE}  restored=${ROWS_VRF}  post=${ROWS_POST}"
     fi
-    echo "$total"
-}
+  done
+  rm -rf "$tmp_dir"
 
-# =========================================
-# Đếm tổng rows trên verify container (luôn docker)
-# =========================================
-count_rows_vrf() {
-    local TARGET_DB="$1"
-    local TBLS total=0
-    TBLS=$(docker exec "$VRF_CTR" mysql -u"$VRF_USER" -p"$VRF_PASS" -N \
-        -e "SHOW TABLES FROM \`${TARGET_DB}\`;" 2>/dev/null | tr '\n' ' ')
-    for t in $TBLS; do
-        local c
-        c=$(docker exec "$VRF_CTR" mysql -u"$VRF_USER" -p"$VRF_PASS" -N \
-            -e "SELECT COUNT(*) FROM \`${TARGET_DB}\`.\`${t}\`;" 2>/dev/null \
-            | tail -1 | tr -d '[:space:]')
-        total=$((total + ${c:-0}))
-    done
-    echo "$total"
-}
+  local total=$((count_ok + count_fail))
+  echo ""
+  echo "  Thành công : ${count_ok} / ${total}"
+  [ "$count_fail" -gt 0 ] && echo "  Thất bại   : ${count_fail} / ${total}"
+  echo "  ════════════════════════════════════════════════════"
 
-# =========================================
-# Dump 1 DB từ source
-# =========================================
-dump_db() {
-    local DB="$1" OUT="$2"
-    if [ "$SRC_MODE" = "1" ]; then
-        docker exec "$SRC_CTR" mysqldump \
-            --single-transaction --routines --triggers --opt \
-            -u"$SRC_USER" -p"$SRC_PASS" "$DB" 2>/dev/null | gzip > "$OUT"
-    else
-        mysqldump --single-transaction --routines --triggers --opt \
-            -u"$SRC_USER" -p"$SRC_PASS" "$DB" 2>/dev/null | gzip > "$OUT"
-    fi
-}
+  local icon="✅"; [ "$count_fail" -gt 0 ] && icon="❌"
+  local status_label="DONE"; [ "$count_fail" -gt 0 ] && status_label="FAIL"
+  local cycle_label=""
+  [ "$INTERVAL_SEC" -gt 0 ] && cycle_label="  Cycle #${cycle} / every $(interval_label "$INTERVAL_RAW")"
 
-# =========================================
-# Lấy danh sách DB từ source (bỏ system DB)
-# =========================================
-list_dbs() {
-    local EXCL="'information_schema','performance_schema','mysql','sys'"
-    local SQL="SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN (${EXCL});"
-    if [ "$SRC_MODE" = "1" ]; then
-        docker exec "$SRC_CTR" mysql -u"$SRC_USER" -p"$SRC_PASS" -N -e "$SQL" 2>/dev/null
-    else
-        mysql -u"$SRC_USER" -p"$SRC_PASS" -N -e "$SQL" 2>/dev/null
-    fi
-}
+  tele_send "${icon} <b>BACKUP - Check BACKUP DB  ${status_label}</b>${cycle_label}
+${tele_detail}
 
-# =========================================
-# Backup + verify 1 DB — trả về 0=OK / 1=FAIL
-# Append kết quả vào mảng RESULTS[]
-#
-# Tại sao dùng pre/post thay vì strict equal:
-#   mysqldump --single-transaction chụp snapshot nhất quán tại
-#   thời điểm BẮT ĐẦU dump. Trong khi dump đang chạy, source
-#   vẫn có thể nhận insert (gen_auto.sh, traffic thật...).
-#   → ROWS_VRF (snapshot lúc dump bắt đầu) luôn ≤ ROWS_POST.
-#   Verify hợp lệ khi: ROWS_PRE ≤ ROWS_VRF ≤ ROWS_POST.
-# =========================================
-backup_one() {
-    local DB="$1"
-    local TS
-    TS=$(date '+%Y%m%d_%H%M%S')
-    local DUMP_FILE="${BACKUP_DIR}/backup_${DB}_${TS}.sql.gz"
-    local VRF_DB="_verify_${TS}"
-    local ROWS_PRE=0 ROWS_POST=0 ROWS_VRF=0 FILE_SIZE="—"
-    local STATUS="OK" MSG=""
+Backup dir: <code>${BACKUP_DIR}</code>
+Start: ${cycle_start}
+End:   ${cycle_end}
+OK: ${count_ok}/${total}  Fail: ${count_fail}/${total}"
 
-    echo ""
-    echo -e "  ${BOLD}━━━ DB: ${DB} ━━━${NC}"
-
-    # ── a. Đếm rows TRƯỚC dump (snapshot pre) ────────────────
-    info "Đếm rows nguồn trước dump (pre-snapshot)..."
-    ROWS_PRE=$(count_rows_src "$DB")
-    info "Rows pre-dump : ${ROWS_PRE}"
-
-    # ── b. Dump ───────────────────────────────────────────────
-    info "Đang dump (--single-transaction)..."
-    if ! dump_db "$DB" "$DUMP_FILE"; then
-        STATUS="FAIL"; MSG="Dump thất bại."
-        fail "$MSG"
-        RESULTS+=("FAIL|${DB}|${MSG}|${ROWS_PRE}|—|—|—|—")
-        return 1
-    fi
-    FILE_SIZE=$(du -sh "$DUMP_FILE" | cut -f1)
-    md5sum "$DUMP_FILE" > "${DUMP_FILE}.md5"
-    ok "Dump OK — ${FILE_SIZE}  →  $(basename "$DUMP_FILE")"
-
-    # ── c. Đếm rows NGAY SAU dump (snapshot post) ────────────
-    #   Dump dùng --single-transaction nên snapshot nằm trong
-    #   khoảng [pre, post]. ROWS_VRF hợp lệ nếu nằm trong range này.
-    info "Đếm rows nguồn sau dump (post-snapshot)..."
-    ROWS_POST=$(count_rows_src "$DB")
-    info "Rows post-dump: ${ROWS_POST}"
-
-    # ── d. MD5 ───────────────────────────────────────────────
-    info "Kiểm tra MD5..."
-    if ! md5sum -c "${DUMP_FILE}.md5" --quiet 2>/dev/null; then
-        STATUS="FAIL"; MSG="MD5 không khớp — file dump bị lỗi."
-        fail "$MSG"
-        RESULTS+=("FAIL|${DB}|${MSG}|${ROWS_PRE}|${ROWS_POST}|—|${FILE_SIZE}|$(basename "$DUMP_FILE")")
-        return 1
-    fi
-    ok "MD5 OK"
-
-    # ── e. Restore thử trên verify container ─────────────────
-    info "Tạo DB tạm '${VRF_DB}' trên verify container '${VRF_CTR}'..."
-    if ! docker exec "$VRF_CTR" mysql -u"$VRF_USER" -p"$VRF_PASS" \
-            -e "CREATE DATABASE \`${VRF_DB}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" \
-            2>/dev/null; then
-        STATUS="FAIL"; MSG="Không tạo được DB tạm '${VRF_DB}' trên verify container."
-        fail "$MSG"
-        RESULTS+=("FAIL|${DB}|${MSG}|${ROWS_PRE}|${ROWS_POST}|—|${FILE_SIZE}|$(basename "$DUMP_FILE")")
-        return 1
-    fi
-
-    info "Đang restore thử..."
-    if ! gunzip -c "$DUMP_FILE" \
-            | docker exec -i "$VRF_CTR" mysql -u"$VRF_USER" -p"$VRF_PASS" "$VRF_DB" 2>/dev/null; then
-        STATUS="FAIL"; MSG="Restore thử thất bại — dump có thể bị hỏng."
-        fail "$MSG"
-        docker exec "$VRF_CTR" mysql -u"$VRF_USER" -p"$VRF_PASS" \
-            -e "DROP DATABASE IF EXISTS \`${VRF_DB}\`;" 2>/dev/null || true
-        RESULTS+=("FAIL|${DB}|${MSG}|${ROWS_PRE}|${ROWS_POST}|—|${FILE_SIZE}|$(basename "$DUMP_FILE")")
-        return 1
-    fi
-    ok "Restore thử OK"
-
-    # ── f. Verify row count (range check) ────────────────────
-    info "Đang đếm rows trên verify container..."
-    ROWS_VRF=$(count_rows_vrf "$VRF_DB")
-
-    echo ""
-    info "  ┌─ Row count summary ─────────────────────────────"
-    info "  │  Source pre-dump  : ${ROWS_PRE}"
-    info "  │  Source post-dump : ${ROWS_POST}  (source vẫn nhận insert trong lúc dump)"
-    info "  │  Restored         : ${ROWS_VRF}  (snapshot nhất quán của dump)"
-    info "  │  Valid range      : ${ROWS_PRE} ≤ restored ≤ ${ROWS_POST}"
-    info "  └─────────────────────────────────────────────────"
-
-    # Drop DB tạm dù kết quả thế nào
-    docker exec "$VRF_CTR" mysql -u"$VRF_USER" -p"$VRF_PASS" \
-        -e "DROP DATABASE IF EXISTS \`${VRF_DB}\`;" 2>/dev/null || true
-    info "Đã drop DB tạm '${VRF_DB}'."
-
-    # Kiểm tra ROWS_VRF nằm trong [ROWS_PRE, ROWS_POST]
-    if [ "${ROWS_VRF}" -lt "${ROWS_PRE}" ] || [ "${ROWS_VRF}" -gt "${ROWS_POST}" ]; then
-        STATUS="FAIL"
-        MSG="Row count ngoài range hợp lệ (pre:${ROWS_PRE} ≤ restored:${ROWS_VRF} ≤ post:${ROWS_POST})."
-        fail "$MSG"
-        RESULTS+=("FAIL|${DB}|${MSG}|${ROWS_PRE}|${ROWS_POST}|${ROWS_VRF}|${FILE_SIZE}|$(basename "$DUMP_FILE")")
-        return 1
-    fi
-
-    ok "Verify OK — restored=${ROWS_VRF} nằm trong range [${ROWS_PRE}, ${ROWS_POST}]."
-    RESULTS+=("OK|${DB}||${ROWS_PRE}|${ROWS_POST}|${ROWS_VRF}|${FILE_SIZE}|$(basename "$DUMP_FILE")")
-    return 0
+  [ "$count_fail" -eq 0 ]     && ok "Cycle #${cycle} hoàn tất. Đã notify Telegram."     || warn "Cycle #${cycle} có ${count_fail} DB lỗi. Đã notify Telegram."
 }
 
 # =========================================
@@ -477,184 +782,74 @@ backup_one() {
 # =========================================
 echo ""
 echo -e "${BOLD}╔══════════════════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}  CRON BACKUP — MariaDB / MySQL${NC}"
-echo    "  Dump → verify restore (container riêng) → notify Telegram"
+echo -e "${BOLD}  BACKUP + VERIFY + NOTIFY — MariaDB/MySQL${NC}"
 echo -e "${BOLD}╚══════════════════════════════════════════════════════╝${NC}"
 echo ""
 
-# ── Chọn loại backup ─────────────────────────────────────────
-echo "  Chọn loại backup:"
-echo "    1) Full — tất cả DB trên instance"
-echo "    2) Một DB cụ thể"
-echo ""
-read -p "  Chọn [1/2]: " BACKUP_TYPE
-echo ""
+# Bước 1: Môi trường
+while true; do setup_env && break; done
 
-# ── Source: docker hay systemd? ──────────────────────────────
-echo "── Source DB ──"
-echo "  DB chạy dạng gì?"
-echo "    1) Docker container"
-echo "    2) Service (systemd / local)"
+# Bước 2: Runtime (b → quay lại env)
+while true; do
+  setup_runtime && break
+  while true; do setup_env && break; done
+done
+
+# Bước 3: Chọn DB
+select_dbs
+
+# Bước 4: Cấu hình
+setup_config
+
+# Preview
 echo ""
-read -p "  Chọn [1/2]: " input; SRC_MODE=${input:-1}
-
-SRC_CTR=""
-if [ "$SRC_MODE" = "1" ]; then
-    read -p "  Tên container (mariadb-104): " input; SRC_CTR=${input:-mariadb-104}
-fi
-read -p "  DB User (root)             : " input; SRC_USER=${input:-root}
-read_pass "  DB Password                : " SRC_PASS
-
-# ── Tên DB (nếu chọn 1 DB) ───────────────────────────────────
-TARGET_DB_SINGLE=""
-if [ "$BACKUP_TYPE" = "2" ]; then
-    read -p "  Tên DB cần backup          : " TARGET_DB_SINGLE
-fi
-
-# ── Verify container ─────────────────────────────────────────
-echo ""
-echo "── Verify container (tự tạo nếu chưa có — luôn dùng Docker) ──"
-read -p "  Tên container              : " VRF_CTR
-
-# ── Thư mục lưu backup ───────────────────────────────────────
-echo ""
-echo "── Lưu file backup ──"
-read -p "  Thư mục backup (/tmp/backup): " input; BACKUP_DIR=${input:-/tmp/backup}
-
-# ── Tần suất chạy ────────────────────────────────────────────
-echo ""
-echo "── Tần suất backup ──"
-echo "  Định dạng : <số><đơn vị>"
-echo "  Đơn vị    : m=phút  h=giờ  d=ngày  w=tuần  y=năm"
-echo "  Ví dụ     : 30m  6h  1d  7d  2w  1y"
-echo "  Để trống  : chỉ chạy 1 lần"
-echo ""
-read -p "  Tần suất (Enter = 1 lần): " INTERVAL_RAW
-
-INTERVAL_SEC=0
-if [ -n "$INTERVAL_RAW" ]; then
-    INTERVAL_SEC=$(parse_interval "$INTERVAL_RAW") || {
-        warn "Không hiểu định dạng '${INTERVAL_RAW}' — sẽ chạy 1 lần."
-        INTERVAL_RAW=""
-        INTERVAL_SEC=0
-    }
-    [ "$INTERVAL_SEC" -le 0 ] && {
-        warn "Tần suất không hợp lệ — sẽ chạy 1 lần."
-        INTERVAL_RAW=""
-        INTERVAL_SEC=0
-    }
-fi
-
-# ── Preview + xác nhận ───────────────────────────────────────
-echo ""
-echo "  ════════════════════════════════════════════════════"
-echo "  Backup type : $([ "$BACKUP_TYPE" = "1" ] && echo "Full (tất cả DB)" || echo "Một DB: ${TARGET_DB_SINGLE}")"
-if [ "$SRC_MODE" = "1" ]; then
-    echo "  Source      : Docker container '${SRC_CTR}'"
+sep
+if [ "$ENV_MODE" = "local" ]; then
+  info "Môi trường  : Local"
 else
-    echo "  Source      : Service (systemd/local)"
-fi
-echo "  DB User     : ${SRC_USER}"
-echo "  Verify CTR  : Docker container '${VRF_CTR}'"
-echo "  Backup dir  : ${BACKUP_DIR}"
-if [ "$INTERVAL_SEC" -gt 0 ]; then
-    echo "  Tần suất    : mỗi $(interval_label "$INTERVAL_RAW")  (${INTERVAL_RAW})"
-else
-    echo "  Tần suất    : 1 lần"
-fi
-if [ -n "$TELE_THREAD_ID" ]; then
-    echo "  Telegram    : chat=${TELE_CHAT_ID}  thread=${TELE_THREAD_ID}"
-else
-    echo "  Telegram    : chat=${TELE_CHAT_ID}  (no thread)"
-fi
-echo "  ════════════════════════════════════════════════════"
-echo ""
-read -p "  Tiếp tục? (yes/no): " confirm
-[[ "$confirm" == "yes" ]] || { echo "  Hủy."; exit 0; }
-
-mkdir -p "$BACKUP_DIR" || { fail "Không tạo được thư mục: ${BACKUP_DIR}"; exit 1; }
-
-# =========================================
-# [0] Kiểm tra kết nối source + verify
-# =========================================
-step "[0] Kiểm tra kết nối..."
-
-if [ "$SRC_MODE" = "1" ]; then
-    docker inspect "$SRC_CTR" &>/dev/null \
-        || { fail "Container source '${SRC_CTR}' không tồn tại."; exit 1; }
-    [ "$(docker inspect -f '{{.State.Running}}' "$SRC_CTR" 2>/dev/null)" = "true" ] \
-        || { fail "Container source '${SRC_CTR}' không đang chạy."; exit 1; }
-    docker exec "$SRC_CTR" mysql -u"$SRC_USER" -p"$SRC_PASS" -N \
-        -e "SELECT 1;" > /dev/null 2>&1 \
-        || { fail "Không kết nối được DB trên source container."; exit 1; }
-    ok "Source container '${SRC_CTR}' OK"
-else
-    mysql -u"$SRC_USER" -p"$SRC_PASS" -N -e "SELECT 1;" > /dev/null 2>&1 \
-        || { fail "Không kết nối được DB trên source (systemd)."; exit 1; }
-    ok "Source service OK"
-fi
-
-docker inspect "$VRF_CTR" &>/dev/null && \
-[ "$(docker inspect -f '{{.State.Running}}' "$VRF_CTR" 2>/dev/null)" = "true" ] && \
-docker exec "$VRF_CTR" mysql -u"$VRF_USER" -p"$VRF_PASS" -N \
-    -e "SELECT 1;" > /dev/null 2>&1
-VRF_LIVE=$?
-
-if [ "$VRF_LIVE" -eq 0 ]; then
-    ok "Verify container '${VRF_CTR}' đang chạy — dùng luôn."
-else
-    warn "Verify container '${VRF_CTR}' chưa tồn tại / chưa chạy — tự tạo..."
-    # Nếu container tồn tại nhưng stopped → xóa trước
-    docker rm -f "$VRF_CTR" > /dev/null 2>&1 || true
-    setup_verify_container "$VRF_CTR"
-fi
-
-# Kiểm tra curl
-command -v curl &>/dev/null || warn "curl không có — Telegram notify sẽ không hoạt động."
-
-# ── Lấy danh sách DB cần backup ──────────────────────────────
-declare -a TARGET_DBS=()
-
-if [ "$BACKUP_TYPE" = "1" ]; then
-    step "[1] Lấy danh sách DB từ source..."
-    DB_LIST=$(list_dbs)
-    if [ -z "$DB_LIST" ]; then
-        fail "Không lấy được danh sách DB."; exit 1
+  for i in $(seq 0 $((SERVER_COUNT - 1))); do
+    info "Server #$((i+1))   : ${SSH_USERS[$i]}@${SERVERS[$i]}:${SSH_PORTS[$i]}"
+    db_str="${SERVER_SELECTED_DBS[$i]:-}"
+    if [ -n "$db_str" ]; then
+      IFS='|' read -ra DBS <<< "$db_str"
+      for DB in "${DBS[@]}"; do info "  DB        : ${DB}"; done
     fi
-    while IFS= read -r db; do
-        [ -n "$db" ] && TARGET_DBS+=("$db")
-    done <<< "$DB_LIST"
-    echo "  DB tìm thấy (${#TARGET_DBS[@]}):"
-    for db in "${TARGET_DBS[@]}"; do info "$db"; done
-else
-    TARGET_DBS=("$TARGET_DB_SINGLE")
+  done
 fi
+[ "$RUNTIME" = "docker" ] \
+  && info "Runtime     : Docker (container: $CONTAINER)" \
+  || info "Runtime     : Service (${MYSQL_HOST}:${MYSQL_PORT})"
+info "Backup dir  : ${BACKUP_DIR}"
+info "Verify CTR  : ${VRF_CONTAINER}"
+[ "$INTERVAL_SEC" -gt 0 ] \
+  && info "Tần suất    : mỗi $(interval_label "$INTERVAL_RAW")" \
+  || info "Tần suất    : 1 lần"
+[ "$TELE_TOKEN" != "your_bot_token_here" ] \
+  && info "Telegram    : chat=${TELE_CHAT_ID}" \
+  || info "Telegram    : chưa config (bỏ qua notify)"
+sep
+
+echo ""
+read -rp "  Tiếp tục? (yes/no): " confirm
+[[ "$confirm" == "yes" ]] || quit
 
 # =========================================
 # Scheduler loop
 # =========================================
 CYCLE=0
-
-if [ "$INTERVAL_SEC" -gt 0 ]; then
-    echo ""
-    ok "Chế độ lặp: mỗi $(interval_label "$INTERVAL_RAW"). Nhấn Ctrl+C để dừng."
-fi
+[ "$INTERVAL_SEC" -gt 0 ] && ok "Chế độ lặp: mỗi $(interval_label "$INTERVAL_RAW"). Nhấn Ctrl+C để dừng."
 
 while true; do
-    CYCLE=$((CYCLE + 1))
-    run_backup_cycle "$CYCLE"
+  CYCLE=$((CYCLE+1))
+  run_cycle "$CYCLE"
 
-    # Chế độ 1 lần → thoát sau cycle đầu
-    [ "$INTERVAL_SEC" -le 0 ] && break
+  [ "$INTERVAL_SEC" -le 0 ] && break
 
-    # Tính thời điểm chạy tiếp
-    NEXT_TS=$(date -d "+${INTERVAL_SEC} seconds" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
-        || date -v "+${INTERVAL_SEC}S" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
-        || echo "N/A")
-
-    echo ""
-    info "Lần chạy tiếp theo: ${NEXT_TS}  (sau $(interval_label "$INTERVAL_RAW"))"
-    info "Nhấn Ctrl+C để dừng."
-
-    sleep "$INTERVAL_SEC"
+  next_ts=$(date -d "+${INTERVAL_SEC} seconds" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
+    || date -v "+${INTERVAL_SEC}S" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
+    || echo "N/A")
+  echo ""
+  info "Lần tiếp theo: ${next_ts}  (sau $(interval_label "$INTERVAL_RAW"))"
+  info "Nhấn Ctrl+C để dừng."
+  sleep "$INTERVAL_SEC"
 done
