@@ -36,6 +36,21 @@ quit() {
   exit 0
 }
 
+read_pass() {
+  local prompt="$1" varname="$2" pass="" char=""
+  printf "%s" "$prompt"
+  while IFS= read -r -s -n1 char; do
+    if   [[ -z "$char" ]];                              then break
+    elif [[ "$char" == $'' || "$char" == $'' ]]; then
+      [ ${#pass} -gt 0 ] && { pass="${pass%?}"; printf " "; }
+    else
+      pass="${pass}${char}"; printf "*"
+    fi
+  done
+  echo ""
+  eval "$varname="$pass""
+}
+
 # =========================================
 # Biến môi trường
 # =========================================
@@ -232,6 +247,8 @@ setup_runtime() {
         echo ""
         read -rp "  Tên container (mariadb-104) : " input
         CONTAINER=${input:-mariadb-104}
+        read -rp "  MySQL User   (root)        : " input; MYSQL_USER=${input:-root}
+        read_pass "  MySQL Pass                 : " MYSQL_PASS
         if check_runtime; then return 0; fi
         ;;
       2)

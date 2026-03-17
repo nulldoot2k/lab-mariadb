@@ -29,6 +29,27 @@ quit() {
   exit 0
 }
 
+read_pass() {
+  local prompt="$1" varname="$2" pass="" char=""
+  printf "%s" "$prompt"
+  while IFS= read -r -s -n1 char; do
+    if   [[ -z "$char" ]];                              then break
+    elif [[ "$char" == $'\x7f' || "$char" == $'\b' ]]; then
+      [ ${#pass} -gt 0 ] && { pass="${pass%?}"; printf "\b \b"; }
+    else
+      pass="${pass}${char}"; printf "*"
+    fi
+  done
+  echo ""
+  eval "$varname=\"$pass\""
+}
+
+confirm_yn() {
+  local prompt="$1" ans
+  read -rp "  ${prompt} (y/yes/no): " ans
+  [[ "$ans" == "y" || "$ans" == "yes" ]]
+}
+
 # =========================================
 # Biến môi trường
 # =========================================
@@ -218,6 +239,8 @@ setup_runtime() {
         echo ""
         read -rp "  Tên container (mariadb-104) : " input
         CONTAINER=${input:-mariadb-104}
+        read -rp "  MySQL User   (root)        : " input; MYSQL_USER=${input:-root}
+        read_pass "  MySQL Pass                 : " MYSQL_PASS
         if check_runtime; then return 0; fi
         ;;
       2)
@@ -702,9 +725,37 @@ while true; do
   select_dbs
   run_check
 
-  read -rp "  Check tiếp? [y/q]: " again
+  echo ""
+  echo -e "  ${BOLD}Tiếp theo?${NC}"
+  echo -e "  ${CYAN}1)${NC}  Chọn lại DB (cùng server)"
+  echo -e "  ${CYAN}2)${NC}  Chọn lại server"
+  echo -e "  ${CYAN}3)${NC}  Thoát"
+  echo ""
+  read -rp "  Chọn [1/2/3]: " again
   case "$again" in
-    y|Y) continue ;;
-    *)   quit ;;
+    1) continue ;;
+    2)
+      # Quay lại chọn env + runtime
+      while true; do setup_env && break; done
+      while true; do
+        setup_runtime && break
+        while true; do setup_env && break; done
+      done
+      echo ""
+      sep
+      if [ "$ENV_MODE" = "local" ]; then
+        info "Môi trường : Local"
+      else
+        for i in $(seq 0 $((SERVER_COUNT - 1))); do
+          info "Server #$((i+1))  : ${SSH_USERS[$i]}@${SERVERS[$i]}:${SSH_PORTS[$i]}"
+        done
+      fi
+      [ "$RUNTIME" = "docker" ] \
+        && info "Runtime    : Docker  (container: $CONTAINER)" \
+        || info "Runtime    : Service (${MYSQL_HOST}:${MYSQL_PORT})"
+      info "Mode       : ${MODE}"
+      sep
+      ;;
+    *) quit ;;
   esac
 done

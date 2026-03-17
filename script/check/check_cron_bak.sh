@@ -531,7 +531,7 @@ backup_one_on() {
   local idx=$1; local DB=$2; local vrf_ctr=$3; local result_file=$4
   local label; [ "$ENV_MODE" = "server" ] && label="${SERVERS[$idx]}" || label="local"
   local TS; TS=$(date '+%Y%m%d_%H%M%S')
-  local dump_fname="backup_${DB}_${TS}.sql.gz"
+  local dump_fname="dump_${DB}_${TS}.sql.gz"
   local dump_path="${BACKUP_DIR}/${dump_fname}"
   local vrf_db="_verify_${TS}"
   local rows_pre=0 rows_post=0 rows_vrf=0 file_size="—"
@@ -573,9 +573,9 @@ backup_one_on() {
 
   if [ "$ENV_MODE" = "server" ]; then
     file_size=$(ssh_exec "$idx" "du -sh "${dump_path}" 2>/dev/null | cut -f1" | tr -d '[:space:]')
-    ssh_exec "$idx" "md5sum "${dump_path}" > "${dump_path}.md5"" &>/dev/null
+    ssh_exec "$idx" "md5sum '${dump_path}' > '${dump_path}.md5'" &>/dev/null
     local md5_ok
-    md5_ok=$(ssh_exec "$idx"       "cd "${BACKUP_DIR}" && md5sum -c "${dump_fname}.md5" --quiet 2>/dev/null && echo ok || echo fail")
+    md5_ok=$(ssh_exec "$idx"       "cd '${BACKUP_DIR}' && md5sum -c '${dump_fname}.md5' --quiet 2>/dev/null && echo ok || echo fail"       | tr -d '[:space:]')
   else
     file_size=$(du -sh "$dump_path" 2>/dev/null | cut -f1 | tr -d '[:space:]')
     md5sum "$dump_path" > "${dump_path}.md5"
@@ -588,6 +588,12 @@ backup_one_on() {
     return 1
   fi
   ok "[${label}] ${DB} — dump OK (${file_size}) → ${dump_fname}"
+  # Xóa .md5 ngay — thư mục chỉ giữ .sql.gz
+  if [ "$ENV_MODE" = "server" ]; then
+    ssh_exec "$idx" "rm -f '${dump_path}.md5'" &>/dev/null || true
+  else
+    rm -f "${dump_path}.md5"
+  fi
 
   # ── c. Đếm rows sau dump ──
   rows_post=$(count_rows_src "$idx" "$DB" 2>/dev/null || echo 0)
